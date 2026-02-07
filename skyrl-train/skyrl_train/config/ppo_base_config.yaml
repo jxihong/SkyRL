@@ -87,7 +87,7 @@ trainer:
       fsdp_size: -1
     sequence_parallel_size: 1
   algorithm:
-    advantage_estimator: "grpo"  # "grpo", "gae", "rloo", "reinforce++", or customizable with AdvantageEstimatorRegistry
+    advantage_estimator: "grpo"  # "grpo", "gae", "rloo", "reinforce++", "icvl", or customizable with AdvantageEstimatorRegistry
     kl_ctrl: # only used if use_kl_in_reward is true (not applied in the case of use_kl_loss=true) - uses kl_loss_coef as the initial KL coefficient
       type: "fixed" # "fixed" or "adaptive"
       kl_target: 0.1 # target KL divergence for adaptive KL controller
@@ -146,6 +146,15 @@ trainer:
     cispo: 
       cispo_eps_clip_low: 0  # offset for lower bound of importance sampling ratio clipping (as opposed to PPO token update clipping)
       cispo_eps_clip_high: 5 # offset for upper bound of importance sampling ratio clipping (as opposed to PPO token update clipping)
+    
+    # icvl parameters (only used when advantage_estimator: "icvl")
+    icvl:
+      # How to format rewards in context ("raw", "normalized")
+      reward_format: "normalized"  # normalize rewards to [0, 1] per group
+      # Sort context trajectories by reward for better ICL pattern learning
+      sort_context_by_reward: true  # if true, sort other trajectories by reward before showing to critic
+      sort_order: "ascending"  # "ascending" (worst to best) or "descending" (best to worst)
+      reward_precision: 4  # number of decimal places for reward formatting
   
   # Fully async specific knobs. For more see http://skyrl.readthedocs.io/en/latest/tutorials/fully_async.html#step-2-config-knobs-to-tune-for-fully-async-training
   fully_async:

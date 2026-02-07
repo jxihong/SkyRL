@@ -430,6 +430,7 @@ class AdvantageEstimator(StrEnum):
     GRPO = "grpo"
     RLOO = "rloo"
     REINFORCE_PP = "reinforce++"
+    ICVL = "icvl"
 
 
 class AdvantageEstimatorRegistry(BaseFunctionRegistry):
@@ -456,6 +457,7 @@ class AdvantageEstimatorRegistry(BaseFunctionRegistry):
             "gae": [AdvantageEstimator.GAE, compute_gae_advantage_return],
             "rloo": [AdvantageEstimator.RLOO, compute_rloo_outcome_advantage],
             "reinforce++": [AdvantageEstimator.REINFORCE_PP, compute_reinforce_plus_plus_outcome_advantage],
+            "icvl": [AdvantageEstimator.ICVL, compute_icvl_advantage_return],
         }
 
         for ae_name, (ae_type, ae_func) in ae_types.items():
@@ -1024,6 +1026,31 @@ def compute_gae_advantage_return(
         returns = advantages + values
         advantages = masked_whiten(advantages, response_mask)
     return advantages, returns
+
+
+@register_advantage_estimator(AdvantageEstimator.ICVL)
+def compute_icvl_advantage_return(
+    token_level_rewards: Float[torch.Tensor, "batch_size seqlen"],
+    values: Float[torch.Tensor, "batch_size seqlen"],
+    response_mask: Float[torch.Tensor, "batch_size seqlen"],
+    index: np.ndarray,
+    gamma: float,
+    lambd: float,
+    **kwargs,
+) -> Tuple[Float[torch.Tensor, "batch_size seqlen"], Float[torch.Tensor, "batch_size seqlen"]]:
+    """
+    Compute advantage and return for ICVL (In-Context Value Learning).
+    """
+    # ICVL uses GAE-style advantage computation but with context-aware values
+    # The context formatting happens before values are computed (in the trainer)
+    return compute_gae_advantage_return(
+        token_level_rewards=token_level_rewards,
+        values=values,
+        response_mask=response_mask,
+        gamma=gamma,
+        lambd=lambd,
+        **kwargs,
+    )
 
 
 @register_advantage_estimator(AdvantageEstimator.GRPO)
