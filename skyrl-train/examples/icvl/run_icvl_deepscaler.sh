@@ -18,7 +18,7 @@ set -x
 
 # --- Configurable env vars with defaults ---
 : "${DATA_DIR:="$HOME/data/deepscaler"}"
-: "${MODEL_NAME:="Qwen/Qwen2.5-1.5B-Instruct"}"
+: "${MODEL_NAME:="Qwen/Qwen3-1.7B"}"
 : "${NUM_GPUS:=4}"
 : "${LOGGER:=wandb}"
 : "${INFERENCE_BACKEND:=vllm}"
