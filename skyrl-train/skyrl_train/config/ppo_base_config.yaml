@@ -147,14 +147,18 @@ trainer:
       cispo_eps_clip_low: 0  # offset for lower bound of importance sampling ratio clipping (as opposed to PPO token update clipping)
       cispo_eps_clip_high: 5 # offset for upper bound of importance sampling ratio clipping (as opposed to PPO token update clipping)
     
-    # icvl parameters (only used when advantage_estimator: "icvl")
-    icvl:
-      # How to format rewards in context ("raw", "normalized")
+    # teacher-distillation parameters
+    teacher_distillation:
+      # Teacher training loss type (currently only "dro" is supported)
+      teacher_loss_type: "dro"
+      # DRO regularization coefficient (higher = teacher stays closer to student distribution)
+      dro_beta: 0.1
+      # ICL context formatting for teacher (reward-before-trajectory format)
       reward_format: "normalized"  # normalize rewards to [0, 1] per group
-      # Sort context trajectories by reward for better ICL pattern learning
-      sort_context_by_reward: true  # if true, sort other trajectories by reward before showing to critic
+      sort_context_by_reward: true  # sort context trajectories by reward
       sort_order: "ascending"  # "ascending" (worst to best) or "descending" (best to worst)
-      reward_precision: 4  # number of decimal places for reward formatting
+      reward_precision: 2  # decimal places for reward formatting in context
+      target_reward: 1.0  # reward value for success conditioning (final [Reward: X] before current response)
   
   # Fully async specific knobs. For more see http://skyrl.readthedocs.io/en/latest/tutorials/fully_async.html#step-2-config-knobs-to-tune-for-fully-async-training
   fully_async:

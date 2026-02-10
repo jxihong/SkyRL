@@ -1,24 +1,10 @@
-# Copyright 2024 Bytedance Ltd. and/or its affiliates
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 """
 Preprocess the DeepScaleR-Preview-Dataset to parquet format for ICVL training.
 
 Dataset: https://huggingface.co/datasets/agentica-org/DeepScaleR-Preview-Dataset
-The dataset contains ~40k math problems with answers from AIME, AMC, Omni-MATH, etc.
 
 Usage:
-    uv run examples/icvl_deepscaler/deepscaler_dataset.py --output_dir $HOME/data/deepscaler
+    uv run examples/teacher_distillation/deepscaler_dataset.py --output_dir $HOME/data/deepscaler
 """
 
 import argparse
@@ -28,7 +14,7 @@ import datasets
 
 
 INSTRUCTION = (
-    "Please solve the following math problem step by step. "
+    "Please solve the above math problem step by step. "
     "Put your final answer within \\boxed{}."
 )
 

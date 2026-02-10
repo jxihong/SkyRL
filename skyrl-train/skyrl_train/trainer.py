@@ -876,15 +876,11 @@ class RayPPOTrainer:
         # For ICVL, the critic gets additional trajectories + rewards from the same prompt (group)
         # to estimate value_refs for only the trajectory at-hand. Ref and policy use original data.
         critic_fwd_pass = data_fwd_pass
-        if (
-            self.critic_model is not None
-            and self.cfg.trainer.algorithm.advantage_estimator == "icvl"
-        ):
+        if self.critic_model is not None and self.cfg.trainer.algorithm.advantage_estimator == "icvl":
             from skyrl_train.utils.icvl_utils import format_icvl_batch_with_context
 
-            # Format sequences with ICVL context: [prompt][other_trajs + rewards] + [current_traj].
-            # The critic still predicts one value per token for the current trajectory only.
-            original_response_length = training_input.metadata["response_length"]
+            # Format sequences with ICVL context: [prompt]+ [other_responses + rewards] + [current_response].
+            # The critic still predicts one value per token for the current response only.
             formatted_sequences, formatted_attention_masks = format_icvl_batch_with_context(
                 sequences=training_input["sequences"],
                 attention_masks=training_input["attention_mask"],
@@ -894,14 +890,14 @@ class RayPPOTrainer:
                 tokenizer=self.tokenizer,
                 config=self.cfg.trainer.algorithm,
                 pad_token_id=self.tokenizer.pad_token_id,
-                response_length=original_response_length,
+                response_length=training_input.metadata["response_length"],
             )
 
             critic_fwd_pass = TrainingInputBatch({
                 "sequences": formatted_sequences,
                 "attention_mask": formatted_attention_masks,
             })
-            critic_fwd_pass.metadata = {"response_length": original_response_length}
+            critic_fwd_pass.metadata = {"response_length": training_input.metadata["response_length"]}
 
         # calculate critic values (ICVL: uses context-formatted batch; else: same as ref/policy)
         if self.colocate_all and self.critic_model is not None:

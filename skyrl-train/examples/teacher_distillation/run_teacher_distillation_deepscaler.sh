@@ -1,24 +1,24 @@
 set -x
 
-# ICVL (In-Context Value Learning) PPO training on the DeepScaleR math dataset.
+# Teacher-Distillation PPO training on the DeepScaleR math dataset.
 #
-# ICVL gives the critic additional (response, reward) context from the same prompt group,
-# allowing it to leverage in-context learning to better estimate values for the current response.
-# Training otherwise proceeds as standard PPO with GAE advantage estimation.
+# The teacher is an identical-architecture policy that sees privileged context
+# (other on-policy rollouts + rewards) and is trained with DRO. The student
+# policy is trained via reverse-KL distillation from the teacher.
 #
 # Prerequisites:
-#   uv run examples/icvl_deepscaler/deepscaler_dataset.py --output_dir $HOME/data/deepscaler
+#   uv run examples/teacher_distillation/deepscaler_dataset.py --output_dir $HOME/data/deepscaler
 #   export WANDB_API_KEY=<your_key_here>
 #
 # Usage:
-#   bash examples/icvl_deepscaler/run_icvl_deepscaler.sh
+#   bash examples/teacher_distillation/run_teacher_distillation_deepscaler.sh
 #
 # You can override defaults via env vars, e.g.:
-#   NUM_GPUS=8 MODEL_NAME=Qwen/Qwen2.5-7B-Instruct bash examples/icvl_deepscaler/run_icvl_deepscaler.sh
+#   NUM_GPUS=8 MODEL_NAME=Qwen/Qwen2.5-7B-Instruct bash examples/teacher_distillation/run_teacher_distillation_deepscaler.sh
 
 # --- Configurable env vars with defaults ---
 : "${DATA_DIR:="$HOME/data/deepscaler"}"
-: "${MODEL_NAME:="Qwen/Qwen2.5-1.5B-Instruct"}"
+: "${MODEL_NAME:="Qwen/Qwen3-1.7B"}"
 : "${NUM_GPUS:=4}"
 : "${LOGGER:=wandb}"
 : "${INFERENCE_BACKEND:=vllm}"
@@ -30,28 +30,35 @@ set -x
 : "${N_SAMPLES_PER_PROMPT:=8}"
 : "${MAX_PROMPT_LENGTH:=1024}"
 : "${MAX_RESPONSE_LENGTH:=2048}"
-: "${LR:=1e-6}"
+: "${POLICY_LR:=1e-6}"
+: "${TEACHER_LR:=1e-6}"
 : "${EPOCHS:=20}"
 : "${KL_LOSS_COEF:=0.001}"
 
-# --- ICVL-specific parameters ---
+# --- Teacher-distillation-specific parameters ---
+# teacher_loss_type: "dro" for Distributionally Robust Optimization
+: "${TEACHER_LOSS_TYPE:=dro}"
+# dro_beta: quadratic regularization coefficient (higher = teacher stays closer to student)
+: "${DRO_BETA:=0.1}"
 # reward_format: "normalized" normalizes rewards to [0, 1] per group; "raw" keeps them as-is
-: "${ICVL_REWARD_FORMAT:=normalized}"
+: "${TD_REWARD_FORMAT:=normalized}"
 # sort_context_by_reward: sort context trajectories by reward for better ICL pattern learning
-: "${ICVL_SORT_CONTEXT:=true}"
+: "${TD_SORT_CONTEXT:=true}"
 # sort_order: "ascending" (worst to best) or "descending" (best to worst)
-: "${ICVL_SORT_ORDER:=ascending}"
+: "${TD_SORT_ORDER:=ascending}"
 # reward_precision: number of decimal places for reward formatting in context
-: "${ICVL_REWARD_PRECISION:=4}"
+: "${TD_REWARD_PRECISION:=2}"
 
-uv run --isolated --extra $INFERENCE_BACKEND -m skyrl_train.entrypoints.main_base \
+uv run --isolated --extra $INFERENCE_BACKEND -m examples.teacher_distillation.main_teacher_distillation \
   data.train_data="['$DATA_DIR/train.parquet']" \
   data.val_data="['$DATA_DIR/validation.parquet']" \
-  trainer.algorithm.advantage_estimator="icvl" \
-  trainer.algorithm.icvl.reward_format="$ICVL_REWARD_FORMAT" \
-  trainer.algorithm.icvl.sort_context_by_reward=$ICVL_SORT_CONTEXT \
-  trainer.algorithm.icvl.sort_order="$ICVL_SORT_ORDER" \
-  trainer.algorithm.icvl.reward_precision=$ICVL_REWARD_PRECISION \
+  trainer.algorithm.advantage_estimator="grpo" \
+  trainer.algorithm.teacher_distillation.teacher_loss_type="$TEACHER_LOSS_TYPE" \
+  trainer.algorithm.teacher_distillation.dro_beta=$DRO_BETA \
+  trainer.algorithm.teacher_distillation.reward_format="$TD_REWARD_FORMAT" \
+  trainer.algorithm.teacher_distillation.sort_context_by_reward=$TD_SORT_CONTEXT \
+  trainer.algorithm.teacher_distillation.sort_order="$TD_SORT_ORDER" \
+  trainer.algorithm.teacher_distillation.reward_precision=$TD_REWARD_PRECISION \
   trainer.policy.model.path="$MODEL_NAME" \
   trainer.critic.model.path="$MODEL_NAME" \
   trainer.placement.colocate_all=true \
@@ -71,7 +78,8 @@ uv run --isolated --extra $INFERENCE_BACKEND -m skyrl_train.entrypoints.main_bas
   trainer.ckpt_interval=10 \
   trainer.max_prompt_length=$MAX_PROMPT_LENGTH \
   generator.sampling_params.max_generate_length=$MAX_RESPONSE_LENGTH \
-  trainer.policy.optimizer_config.lr=$LR \
+  trainer.policy.optimizer_config.lr=$POLICY_LR \
+  trainer.critic.optimizer_config.lr=$TEACHER_LR \
   trainer.algorithm.use_kl_loss=true \
   trainer.algorithm.kl_loss_coef=$KL_LOSS_COEF \
   generator.backend=$INFERENCE_BACKEND \
@@ -83,10 +91,10 @@ uv run --isolated --extra $INFERENCE_BACKEND -m skyrl_train.entrypoints.main_bas
   generator.n_samples_per_prompt=$N_SAMPLES_PER_PROMPT \
   generator.gpu_memory_utilization=0.8 \
   trainer.logger="$LOGGER" \
-  trainer.project_name="icvl_deepscaler" \
-  trainer.run_name="icvl_deepscaler_$(basename $MODEL_NAME)" \
+  trainer.project_name="teacher_distillation_deepscaler" \
+  trainer.run_name="td_deepscaler_$(basename $MODEL_NAME)" \
   trainer.resume_mode=null \
-  trainer.ckpt_path="$HOME/ckpts/icvl_deepscaler_ckpt" \
+  trainer.ckpt_path="$HOME/ckpts/td_deepscaler_ckpt" \
   trainer.eval_batch_size=1024 \
   trainer.eval_before_train=true \
   trainer.eval_interval=5 \
