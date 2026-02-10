@@ -267,7 +267,7 @@ def format_teacher_context(
         [Reward: 1.0]  ← success conditioning
         [current trajectory prefix]
     """
-    from skyrl_train.examples.teacher_distillation.teacher_distillation_utils import format_teacher_icl_context
+    from .teacher_distillation_utils import format_teacher_icl_context
 
     return format_teacher_icl_context(
         sequences=sequences,

@@ -2,10 +2,6 @@ set -x
 
 # Teacher-Distillation PPO training on the DeepScaleR math dataset.
 #
-# The teacher is an identical-architecture policy that sees privileged context
-# (other on-policy rollouts + rewards) and is trained with DRO. The student
-# policy is trained via reverse-KL distillation from the teacher.
-#
 # Prerequisites:
 #   uv run examples/teacher_distillation/deepscaler_dataset.py --output_dir $HOME/data/deepscaler
 #   export WANDB_API_KEY=<your_key_here>
