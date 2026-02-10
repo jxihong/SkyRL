@@ -880,7 +880,7 @@ class RayPPOTrainer:
             self.critic_model is not None
             and self.cfg.trainer.algorithm.advantage_estimator == "icvl"
         ):
-            from skyrl_train.examples.icvl.icvl_utils import format_icvl_batch_with_context
+            from skyrl_train.utils.icvl_utils import format_icvl_batch_with_context
 
             # Format sequences with ICVL context: [prompt][other_trajs + rewards] + [current_traj].
             # The critic still predicts one value per token for the current trajectory only.
