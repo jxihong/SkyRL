@@ -181,7 +181,43 @@ def ppo_critic_loss(
     returns: torch.Tensor,
     config: DictConfig,
     loss_mask: Optional[torch.Tensor] = None,
+    value_logits: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Optional[float]]:
+    value_head_type = getattr(config, "value_head_type", "regression")
+    value_min = getattr(config, "value_min", 0.0)
+    value_max = getattr(config, "value_max", 1.0)
+
+    if value_head_type == "cross_entropy" and value_logits is not None:
+        # Cross-entropy: predict which bin the return falls into; value = E[bin midpoint]
+        value_num_bins = getattr(config, "value_num_bins", 32)
+        # Bin index in [0, value_num_bins - 1]; clamp returns outside [min, max]
+        scale = (value_max - value_min) or 1.0
+        bin_idx = (
+            ((returns - value_min) / scale * value_num_bins).long().clamp(0, value_num_bins - 1)
+        )
+        # value_logits: (B, T, num_bins)
+        loss = torch.nn.functional.cross_entropy(
+            value_logits.reshape(-1, value_num_bins),
+            bin_idx.reshape(-1),
+            reduction="none",
+        ).reshape(returns.shape)
+        loss = masked_mean(loss, loss_mask, dim=-1).mean()
+        return loss, None  # no clipfrac for CE
+
+    if value_head_type == "sigmoid" and value_logits is not None:
+        # Binary cross-entropy: predict reward class (value_min=0 vs value_max=1)
+        # Target: 1 if return >= midpoint, else 0
+        midpoint = (value_min + value_max) / 2.0
+        target = (returns >= midpoint).float()
+        # value_logits: (B, T, 1); use reshape for FSDP/sharded tensors
+        loss = torch.nn.functional.binary_cross_entropy_with_logits(
+            value_logits.reshape(-1),
+            target.reshape(-1),
+            reduction="none",
+        ).reshape(returns.shape)
+        loss = masked_mean(loss, loss_mask, dim=-1).mean()
+        return loss, None  # no clipfrac for sigmoid
+
     if config.value_clip is not None:
         values_clipped = old_values + (values - old_values).clamp(-config.value_clip, config.value_clip)
         surr1 = (values_clipped - returns) ** 2

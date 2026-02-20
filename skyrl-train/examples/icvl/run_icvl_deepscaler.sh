@@ -7,19 +7,23 @@ set -x
 # Training otherwise proceeds as standard PPO with GAE advantage estimation.
 #
 # Prerequisites:
-#   uv run examples/icvl_deepscaler/deepscaler_dataset.py --output_dir $HOME/data/deepscaler
+#   uv run examples/icvl/deepscaler_dataset.py --output_dir $HOME/data/deepscaler
 #   export WANDB_API_KEY=<your_key_here>
 #
 # Usage:
-#   bash examples/icvl_deepscaler/run_icvl_deepscaler.sh
+#   bash examples/icvl/run_icvl_deepscaler.sh
 #
-# You can override defaults via env vars, e.g.:
-#   NUM_GPUS=8 MODEL_NAME=Qwen/Qwen2.5-7B-Instruct bash examples/icvl_deepscaler/run_icvl_deepscaler.sh
+# Choose which algorithm: ESTIMATOR=ppo, ESTIMATOR=grpo, or ESTIMATOR=icvl (default).
+#   ESTIMATOR=ppo  bash examples/icvl/run_icvl_deepscaler.sh
+#   ESTIMATOR=grpo bash examples/icvl/run_icvl_deepscaler.sh
+#   ESTIMATOR=icvl bash examples/icvl/run_icvl_deepscaler.sh
+# Other overrides, e.g.:
+#   ENABLE_THINKING=false MODEL_NAME=Qwen/Qwen2.5-7B-Instruct bash examples/icvl/run_icvl_deepscaler.sh
 
 # --- Configurable env vars with defaults ---
 : "${DATA_DIR:="$HOME/data/deepscaler"}"
 : "${MODEL_NAME:="Qwen/Qwen3-1.7B"}"
-: "${NUM_GPUS:=4}"
+: "${NUM_GPUS:=8}"
 : "${LOGGER:=wandb}"
 : "${INFERENCE_BACKEND:=vllm}"
 
@@ -29,65 +33,126 @@ set -x
 : "${CRITIC_MINI_BATCH_SIZE:=256}"
 : "${N_SAMPLES_PER_PROMPT:=8}"
 : "${MAX_PROMPT_LENGTH:=1024}"
-: "${MAX_RESPONSE_LENGTH:=2048}"
+: "${MAX_RESPONSE_LENGTH:=8192}"
 : "${LR:=1e-6}"
 : "${EPOCHS:=20}"
 : "${KL_LOSS_COEF:=0.001}"
 
 # --- ICVL-specific parameters ---
-# reward_format: "normalized" normalizes rewards to [0, 1] per group; "raw" keeps them as-is
-: "${ICVL_REWARD_FORMAT:=normalized}"
+: "${ICVL_REWARD_FORMAT:=raw}"
 # sort_context_by_reward: sort context trajectories by reward for better ICL pattern learning
 : "${ICVL_SORT_CONTEXT:=true}"
 # sort_order: "ascending" (worst to best) or "descending" (best to worst)
 : "${ICVL_SORT_ORDER:=ascending}"
 # reward_precision: number of decimal places for reward formatting in context
-: "${ICVL_REWARD_PRECISION:=4}"
+: "${ICVL_REWARD_PRECISION:=2}"
 
-uv run --isolated --extra $INFERENCE_BACKEND -m skyrl_train.entrypoints.main_base \
-  data.train_data="['$DATA_DIR/train.parquet']" \
-  data.val_data="['$DATA_DIR/validation.parquet']" \
-  trainer.algorithm.advantage_estimator="icvl" \
-  trainer.algorithm.icvl.reward_format="$ICVL_REWARD_FORMAT" \
-  trainer.algorithm.icvl.sort_context_by_reward=$ICVL_SORT_CONTEXT \
-  trainer.algorithm.icvl.sort_order="$ICVL_SORT_ORDER" \
-  trainer.algorithm.icvl.reward_precision=$ICVL_REWARD_PRECISION \
-  trainer.policy.model.path="$MODEL_NAME" \
-  trainer.critic.model.path="$MODEL_NAME" \
-  trainer.placement.colocate_all=true \
-  trainer.strategy=fsdp2 \
-  trainer.placement.policy_num_gpus_per_node=$NUM_GPUS \
-  trainer.placement.ref_num_gpus_per_node=$NUM_GPUS \
-  trainer.placement.critic_num_gpus_per_node=$NUM_GPUS \
-  generator.num_inference_engines=$NUM_GPUS \
-  generator.inference_engine_tensor_parallel_size=1 \
-  trainer.epochs=$EPOCHS \
-  trainer.update_epochs_per_batch=1 \
-  trainer.train_batch_size=$TRAIN_BATCH_SIZE \
-  trainer.policy_mini_batch_size=$POLICY_MINI_BATCH_SIZE \
-  trainer.critic_mini_batch_size=$CRITIC_MINI_BATCH_SIZE \
-  trainer.micro_forward_batch_size_per_gpu=64 \
-  trainer.micro_train_batch_size_per_gpu=64 \
-  trainer.ckpt_interval=10 \
-  trainer.max_prompt_length=$MAX_PROMPT_LENGTH \
-  generator.sampling_params.max_generate_length=$MAX_RESPONSE_LENGTH \
-  trainer.policy.optimizer_config.lr=$LR \
-  trainer.algorithm.use_kl_loss=true \
-  trainer.algorithm.kl_loss_coef=$KL_LOSS_COEF \
-  generator.backend=$INFERENCE_BACKEND \
-  generator.run_engines_locally=true \
-  generator.weight_sync_backend=nccl \
-  generator.async_engine=true \
-  generator.batched=true \
-  environment.env_class=aime \
-  generator.n_samples_per_prompt=$N_SAMPLES_PER_PROMPT \
-  generator.gpu_memory_utilization=0.8 \
-  trainer.logger="$LOGGER" \
-  trainer.project_name="icvl_deepscaler" \
-  trainer.run_name="icvl_deepscaler_$(basename $MODEL_NAME)" \
-  trainer.resume_mode=null \
-  trainer.ckpt_path="$HOME/ckpts/icvl_deepscaler_ckpt" \
-  trainer.eval_batch_size=1024 \
-  trainer.eval_before_train=true \
-  trainer.eval_interval=5 \
-  $@
+# --- Value head type: regression (default), cross_entropy (bins), or sigmoid (binary BCE) ---
+# USE_CE_VALUE_HEAD=true: critic predicts reward (cross-entropy). Uses VALUE_MIN, VALUE_MAX, VALUE_NUM_BINS.
+# USE_SIGMOID_VALUE_HEAD=true: critic predicts binary reward (BCE) with classes VALUE_MIN, VALUE_MAX.
+: "${USE_CE_VALUE_HEAD:=false}"
+: "${USE_SIGMOID_VALUE_HEAD:=true}"
+: "${VALUE_MIN:=-1.0}"
+: "${VALUE_MAX:=1.0}"
+: "${VALUE_NUM_BINS:=51}"
+
+# Set to "true" to enable thinking, "false" to disable. Empty = model default (usually true).
+: "${ENABLE_THINKING:=}"
+if [ -n "$ENABLE_THINKING" ]; then
+  : "${BATCHED:=false}"
+else
+  : "${BATCHED:=true}"
+fi
+
+# Shared wandb group so runs can be grouped for comparison across invocations.
+: "${EXPERIMENT_GROUP:=icvl_deepscaler_$(basename $MODEL_NAME)}"
+# Which algorithm to run: "ppo" (GAE baseline), "grpo", or "icvl". Only one runs per invocation.
+: "${ESTIMATOR:=icvl}"
+
+_run_common() {
+  uv run --isolated --extra $INFERENCE_BACKEND -m skyrl_train.entrypoints.main_base \
+    data.train_data="['$DATA_DIR/train.parquet']" \
+    data.val_data="['$DATA_DIR/validation.parquet']" \
+    trainer.policy.model.path="$MODEL_NAME" \
+    trainer.critic.model.path="$MODEL_NAME" \
+    trainer.placement.colocate_all=true \
+    trainer.strategy=fsdp2 \
+    trainer.placement.policy_num_gpus_per_node=$NUM_GPUS \
+    trainer.placement.ref_num_gpus_per_node=$NUM_GPUS \
+    trainer.placement.critic_num_gpus_per_node=$NUM_GPUS \
+    generator.num_inference_engines=$NUM_GPUS \
+    generator.inference_engine_tensor_parallel_size=1 \
+    trainer.epochs=$EPOCHS \
+    trainer.update_epochs_per_batch=1 \
+    trainer.train_batch_size=$TRAIN_BATCH_SIZE \
+    trainer.policy_mini_batch_size=$POLICY_MINI_BATCH_SIZE \
+    trainer.critic_mini_batch_size=$CRITIC_MINI_BATCH_SIZE \
+    trainer.micro_forward_batch_size_per_gpu=8 \
+    trainer.micro_train_batch_size_per_gpu=8 \
+    trainer.ckpt_interval=10 \
+    trainer.max_prompt_length=$MAX_PROMPT_LENGTH \
+    generator.sampling_params.max_generate_length=$MAX_RESPONSE_LENGTH \
+    trainer.policy.optimizer_config.lr=$LR \
+    trainer.algorithm.use_kl_loss=true \
+    trainer.algorithm.kl_loss_coef=$KL_LOSS_COEF \
+    generator.backend=$INFERENCE_BACKEND \
+    generator.run_engines_locally=true \
+    generator.weight_sync_backend=nccl \
+    generator.async_engine=true \
+    generator.batched=$BATCHED \
+    environment.env_class=aime \
+    +environment.skyrl_gym.aime.strict_box_verify=${STRICT_BOX_VERIFY:-true} \
+    generator.n_samples_per_prompt=$N_SAMPLES_PER_PROMPT \
+    generator.gpu_memory_utilization=0.8 \
+    trainer.logger="$LOGGER" \
+    trainer.project_name="icvl_deepscaler" \
+    trainer.run_group="$EXPERIMENT_GROUP" \
+    trainer.resume_mode=null \
+    trainer.eval_batch_size=1024 \
+    trainer.eval_before_train=true \
+    trainer.eval_interval=5 \
+    ${ENABLE_THINKING:++generator.chat_template_kwargs={enable_thinking:$ENABLE_THINKING}} \
+    ${USE_CE_VALUE_HEAD:+trainer.algorithm.value_head_type=cross_entropy} \
+    ${USE_CE_VALUE_HEAD:+trainer.algorithm.value_min=$VALUE_MIN} \
+    ${USE_CE_VALUE_HEAD:+trainer.algorithm.value_max=$VALUE_MAX} \
+    ${USE_CE_VALUE_HEAD:+trainer.algorithm.value_num_bins=$VALUE_NUM_BINS} \
+    ${USE_SIGMOID_VALUE_HEAD:+trainer.algorithm.value_head_type=sigmoid} \
+    ${USE_SIGMOID_VALUE_HEAD:+trainer.algorithm.value_min=$VALUE_MIN} \
+    ${USE_SIGMOID_VALUE_HEAD:+trainer.algorithm.value_max=$VALUE_MAX} \
+    "$@"
+}
+
+case "$ESTIMATOR" in
+  ppo)
+    echo "========== Running PPO (GAE) baseline =========="
+    _run_common \
+      trainer.algorithm.advantage_estimator="gae" \
+      trainer.run_name="ppo_deepscaler_$(basename $MODEL_NAME)" \
+      trainer.ckpt_path="$HOME/ckpts/ppo_deepscaler_ckpt" \
+      "$@"
+    ;;
+  grpo)
+    echo "========== Running GRPO baseline =========="
+    _run_common \
+      trainer.algorithm.advantage_estimator="grpo" \
+      trainer.run_name="grpo_deepscaler_$(basename $MODEL_NAME)" \
+      trainer.ckpt_path="$HOME/ckpts/grpo_deepscaler_ckpt" \
+      "$@"
+    ;;
+  icvl)
+    echo "========== Running ICVL =========="
+    _run_common \
+      trainer.algorithm.advantage_estimator="icvl" \
+      trainer.algorithm.icvl.reward_format="$ICVL_REWARD_FORMAT" \
+      trainer.algorithm.icvl.sort_context_by_reward=$ICVL_SORT_CONTEXT \
+      trainer.algorithm.icvl.sort_order="$ICVL_SORT_ORDER" \
+      trainer.algorithm.icvl.reward_precision=$ICVL_REWARD_PRECISION \
+      trainer.run_name="icvl_deepscaler_$(basename $MODEL_NAME)" \
+      trainer.ckpt_path="$HOME/ckpts/icvl_deepscaler_ckpt" \
+      "$@"
+    ;;
+  *)
+    echo "Invalid ESTIMATOR='$ESTIMATOR'. Use 'ppo', 'grpo', or 'icvl'." >&2
+    exit 1
+    ;;
+esac

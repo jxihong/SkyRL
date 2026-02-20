@@ -278,33 +278,62 @@ def fsdp2_load_full_state_dict(model: torch.nn.Module, full_sd: dict, cpu_offloa
             tensor = tensor.contiguous()
         return tensor
 
-    if dist.get_rank() == 0:
-        for (param_name, full_param), sharded_param in zip(full_sd.items(), meta_sharded_sd.values()):
+    def _handle_param(param_name, full_param, sharded_param):
+        """Distribute a parameter (DTensor) or broadcast a buffer (plain Tensor)."""
+        if not hasattr(sharded_param, "device_mesh"):
+            # Buffer or other plain Tensor (e.g. value_bin_midpoints); replicate on all ranks
             full_param = full_param.detach().cuda()
-            mesh = sharded_param.device_mesh
+            if dist.get_rank() != 0:
+                full_param = torch.empty(
+                    sharded_param.size(), device="cuda", dtype=sharded_param.dtype
+                )
             dist.broadcast(full_param, src=0)
-            sharded_tensor = distribute_tensor(full_param, mesh, sharded_param.placements)
             to_contiguous, casting_dtype = _infer_parameter_dtype(
-                model,
-                param_name,
-                full_param,
+                model, param_name, full_param
             )
-            sharded_tensor = _cast_and_contiguous(sharded_tensor, to_contiguous, casting_dtype)
-            sharded_sd[param_name] = sharded_tensor
-    # We need this else to have a matching `broadcast` for all of the ranks, else we deadlock
+            return _cast_and_contiguous(full_param, to_contiguous, casting_dtype)
+        # Sharded parameter (DTensor)
+        full_param = full_param.detach().cuda()
+        mesh = sharded_param.device_mesh
+        dist.broadcast(full_param, src=0)
+        sharded_tensor = distribute_tensor(full_param, mesh, sharded_param.placements)
+        to_contiguous, casting_dtype = _infer_parameter_dtype(
+            model, param_name, full_param
+        )
+        return _cast_and_contiguous(sharded_tensor, to_contiguous, casting_dtype)
+
+    if dist.get_rank() == 0:
+        for (param_name, full_param), sharded_param in zip(
+            full_sd.items(), meta_sharded_sd.values()
+        ):
+            sharded_sd[param_name] = _handle_param(
+                param_name, full_param, sharded_param
+            )
     else:
         for param_name, sharded_param in meta_sharded_sd.items():
-            full_tensor = torch.empty(sharded_param.size(), device="cuda", dtype=sharded_param.dtype)
-            mesh = sharded_param.device_mesh
-            dist.broadcast(full_tensor, src=0)
-            sharded_tensor = distribute_tensor(full_tensor, mesh, sharded_param.placements)
-            to_contiguous, casting_dtype = _infer_parameter_dtype(
-                model,
-                param_name,
-                full_tensor,
+            full_tensor = torch.empty(
+                sharded_param.size(), device="cuda", dtype=sharded_param.dtype
             )
-            sharded_tensor = _cast_and_contiguous(sharded_tensor, to_contiguous, casting_dtype)
-            sharded_sd[param_name] = sharded_tensor
+            if hasattr(sharded_param, "device_mesh"):
+                dist.broadcast(full_tensor, src=0)
+                mesh = sharded_param.device_mesh
+                sharded_tensor = distribute_tensor(
+                    full_tensor, mesh, sharded_param.placements
+                )
+                to_contiguous, casting_dtype = _infer_parameter_dtype(
+                    model, param_name, full_tensor
+                )
+                sharded_sd[param_name] = _cast_and_contiguous(
+                    sharded_tensor, to_contiguous, casting_dtype
+                )
+            else:
+                dist.broadcast(full_tensor, src=0)
+                to_contiguous, casting_dtype = _infer_parameter_dtype(
+                    model, param_name, full_tensor
+                )
+                sharded_sd[param_name] = _cast_and_contiguous(
+                    full_tensor, to_contiguous, casting_dtype
+                )
 
     # we set `assign=True` because our params can be on meta device
     model.load_state_dict(sharded_sd, assign=True)

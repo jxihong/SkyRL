@@ -283,6 +283,8 @@ class FSDPCriticWorkerBase(CriticWorkerBase):
             use_meta_tensor=not model_config.tie_word_embeddings, mesh=self.strategy.device_mesh
         )
         with init_context():
+            algo = self.cfg.trainer.algorithm
+            value_head_type = getattr(algo, "value_head_type", "regression")
             critic = get_llm_for_sequence_regression(
                 model_path,
                 "critic",
@@ -295,10 +297,14 @@ class FSDPCriticWorkerBase(CriticWorkerBase):
                 lora_dropout=self.cfg.trainer.critic.model.lora.dropout,
                 target_modules=self.cfg.trainer.critic.model.lora.target_modules,
                 exclude_modules=self.cfg.trainer.critic.model.lora.exclude_modules,
-                value_head_prefix=self.cfg.trainer.algorithm.value_head_prefix,
+                value_head_prefix=algo.value_head_prefix,
                 init_value_head=self.cfg.trainer.policy.model.path == self.cfg.trainer.critic.model.path,
                 sequence_parallel_size=self.cfg.trainer.critic.sequence_parallel_size,
                 use_sample_packing=self.cfg.trainer.use_sample_packing,
+                value_head_type=value_head_type,
+                value_min=getattr(algo, "value_min", 0.0),
+                value_max=getattr(algo, "value_max", 1.0),
+                value_num_bins=getattr(algo, "value_num_bins", None) if value_head_type == "cross_entropy" else None,
             )
             self._seq_parallel_monkey_patch(model=critic, use_parent_class=True)
 

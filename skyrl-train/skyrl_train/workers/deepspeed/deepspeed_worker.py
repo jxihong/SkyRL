@@ -252,6 +252,8 @@ class DeepSpeedCriticWorkerBase(CriticWorkerBase):
         ds_config = strategy.get_ds_train_config()
         # with torch.device("meta"):
         #     AutoModel.from_pretrained(pretrain, trust_remote_code=True)
+        algo = self.cfg.trainer.algorithm
+        value_head_type = getattr(algo, "value_head_type", "regression")
         critic = get_llm_for_sequence_regression(
             model_id_or_path,
             "critic",
@@ -260,10 +262,14 @@ class DeepSpeedCriticWorkerBase(CriticWorkerBase):
             target_modules=self.cfg.trainer.critic.model.lora.target_modules,
             exclude_modules=self.cfg.trainer.critic.model.lora.exclude_modules,
             ds_config=ds_config,
-            value_head_prefix=self.cfg.trainer.algorithm.value_head_prefix,
+            value_head_prefix=algo.value_head_prefix,
             init_value_head=self.cfg.trainer.policy.model.path == self.cfg.trainer.critic.model.path,
             sequence_parallel_size=self.sequence_parallel_size,
             use_sample_packing=self.cfg.trainer.use_sample_packing,
+            value_head_type=value_head_type,
+            value_min=getattr(algo, "value_min", 0.0),
+            value_max=getattr(algo, "value_max", 1.0),
+            value_num_bins=getattr(algo, "value_num_bins", None) if value_head_type == "cross_entropy" else None,
         )
         # configure optimizer
         critic_optim = strategy.create_optimizer(

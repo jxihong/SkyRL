@@ -919,12 +919,14 @@ class CriticWorkerBase(Worker):
                 return_output=True,
             )
             # loss function
+            value_logits = output.get("value_logits") if isinstance(output, dict) else None
             loss, clipfrac = self.critic_loss_fn(
                 values,
                 old_values,
                 returns,
                 config=self.cfg.trainer.algorithm,
                 loss_mask=loss_mask,
+                value_logits=value_logits,
             )
         loss = loss / accumulation_steps
         self.strategy.backward(loss, self.model, self.optimizer)
@@ -932,8 +934,9 @@ class CriticWorkerBase(Worker):
         status = {
             "critic_loss": loss.item(),
             "values_mean": masked_mean(values, loss_mask).item(),
-            "values_clipfrac": clipfrac,
         }
+        if clipfrac is not None:
+            status["values_clipfrac"] = clipfrac
         return status
 
     def optim_step(self) -> float:

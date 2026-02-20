@@ -426,7 +426,27 @@ def _get_critic_model(
             setattr(self, self.base_model_prefix, base_llm_model(config))
 
             self.value_head_prefix = value_head_prefix
-            setattr(self, value_head_prefix, nn.Linear(config.hidden_size, 1, bias=False))
+            self.value_head_type = getattr(config, "value_head_type", "regression")
+            self._use_value_bins = self.value_head_type == "cross_entropy"
+            self._use_value_sigmoid = self.value_head_type == "sigmoid"
+            if self._use_value_bins:
+                value_num_bins = getattr(config, "value_num_bins", 32)
+                value_min = getattr(config, "value_min", 0.0)
+                value_max = getattr(config, "value_max", 1.0)
+                setattr(
+                    self,
+                    value_head_prefix,
+                    nn.Linear(config.hidden_size, value_num_bins, bias=False),
+                )
+                # Midpoint of each bin: bin i has midpoint value_min + (i + 0.5) * (value_max - value_min) / value_num_bins
+                step = (value_max - value_min) / value_num_bins
+                bin_midpoints = torch.tensor(
+                    [value_min + (i + 0.5) * step for i in range(value_num_bins)],
+                    dtype=torch.float32,
+                )
+                self.register_buffer("value_bin_midpoints", bin_midpoints)
+            else:
+                setattr(self, value_head_prefix, nn.Linear(config.hidden_size, 1, bias=False))
 
             self.sequence_parallel_size = sequence_parallel_size
             self.use_sample_packing = use_sample_packing
@@ -493,13 +513,32 @@ def _get_critic_model(
                 )
                 last_hidden_states_BSH = last_hidden_states_SH.unsqueeze(0)
 
-            values_BSH = getattr(self, self.value_head_prefix)(last_hidden_states_BSH)
+            logits_or_values_BSH = getattr(self, self.value_head_prefix)(last_hidden_states_BSH)
+
+            if self._use_value_bins:
+                # logits_BSH: (B, S, num_bins); value = E[bin] = probs @ bin_midpoints
+                probs_BSH = torch.softmax(logits_or_values_BSH.float(), dim=-1).to(logits_or_values_BSH.dtype)
+                bin_midpoints = self.value_bin_midpoints.to(probs_BSH.device).to(probs_BSH.dtype)
+                values_BSH = probs_BSH @ bin_midpoints  # (B, S)
+                values_BSH = values_BSH.unsqueeze(-1)  # (B, S, 1)
+            elif self._use_value_sigmoid:
+                # logits_BSH: (B, S, 1); value = value_min + sigmoid(logit) * (value_max - value_min)
+                value_min = getattr(self.config, "value_min", 0.0)
+                value_max = getattr(self.config, "value_max", 1.0)
+                prob = torch.sigmoid(logits_or_values_BSH.float()).to(logits_or_values_BSH.dtype)
+                values_BSH = (value_min + prob * (value_max - value_min))
+            else:
+                values_BSH = logits_or_values_BSH
 
             if self.use_sample_packing:
                 # add padding back - postprocess logits to be compatible with original tensors
                 batch_size, seqlen = attention_mask.shape
                 # (1, nnz, 1) -> (nnz, 1) -> (batch_size, seqlen, 1)
                 values_BSH = pad_input(values_BSH.squeeze(0), indices=nnz_indices, batch=batch_size, seqlen=seqlen)
+                if self._use_value_bins or self._use_value_sigmoid:
+                    logits_or_values_BSH = pad_input(
+                        logits_or_values_BSH.squeeze(0), indices=nnz_indices, batch=batch_size, seqlen=seqlen
+                    )
 
             values = values_BSH.squeeze(-1)[:, :-1]
 
@@ -510,6 +549,10 @@ def _get_critic_model(
             action_values = values[:, -num_actions:]
 
             if return_output:
+                if self._use_value_bins or self._use_value_sigmoid:
+                    # value_logits for action positions (same as action_values: last n_act of values = seq indices -n_act-1:-1)
+                    n_act = num_actions if isinstance(num_actions, int) else int(num_actions.max())
+                    outputs["value_logits"] = logits_or_values_BSH[:, -n_act - 1 : -1, :]
                 return (action_values, outputs)
             else:
                 return action_values
@@ -537,6 +580,10 @@ def get_llm_for_sequence_regression(
     device_map=None,
     sequence_parallel_size=1,
     use_sample_packing: bool = False,
+    value_head_type: str = "regression",
+    value_min: float = 0.0,
+    value_max: float = 1.0,
+    value_num_bins: Optional[int] = None,
     **kwargs,
 ) -> nn.Module:
     """Get transformer with a sequence classification head on top (linear layer).
@@ -556,6 +603,15 @@ def get_llm_for_sequence_regression(
 
     config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=True)
     config._attn_implementation = "flash_attention_2" if use_flash_attention_2 else "eager"
+    if value_head_type == "cross_entropy" and value_num_bins is not None:
+        config.value_head_type = "cross_entropy"
+        config.value_min = value_min
+        config.value_max = value_max
+        config.value_num_bins = value_num_bins
+    elif value_head_type == "sigmoid":
+        config.value_head_type = "sigmoid"
+        config.value_min = value_min
+        config.value_max = value_max
 
     base_class = AutoModel._model_mapping[type(config)]
     base_pretrained_class = base_class.__base__

@@ -242,6 +242,7 @@ class BasePPOExp:
             experiment_name=self.cfg.trainer.run_name,
             backends=self.cfg.trainer.logger,
             config=self.cfg,
+            run_group=getattr(self.cfg.trainer, "run_group", None),
         )
 
     def _setup_trainer(self):
