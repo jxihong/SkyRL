@@ -1,7 +1,7 @@
 from skyrl_gym.envs.base_text_env import BaseTextEnv, BaseTextEnvStepOutput
 from skyrl_gym.envs.aime import utils
 from typing import Dict, Any
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 
 
 class AIMEEnv(BaseTextEnv):
@@ -16,10 +16,17 @@ class AIMEEnv(BaseTextEnv):
         assert "ground_truth" in extras["reward_model"], "ground_truth is required in reward_model field"
         self.ground_truth = extras["reward_model"]["ground_truth"]
 
+        # When True, verify using \\boxed{} extraction (matches "Put your final answer within \\boxed{}").
+        # When False, use Minerva-style "Answer :" pattern. Must match the dataset instruction.
+        self.strict_box_verify = OmegaConf.select(env_config, "strict_box_verify", default=False)
+
     def step(self, action: str) -> BaseTextEnvStepOutput:
         done = True  # always done after one step
 
-        score_info = utils.compute_score(action, self.ground_truth)
+        score_info = utils.compute_score(
+            action, self.ground_truth, strict_box_verify=self.strict_box_verify
+        )
+
         reward = score_info["score"]
         metadata = {"acc": score_info["acc"], "pred": score_info["pred"]}
 

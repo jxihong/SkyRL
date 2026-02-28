@@ -153,6 +153,13 @@ trainer:
       teacher_loss_type: "dro"
       # DRO regularization coefficient (higher = teacher stays closer to student distribution)
       dro_beta: 0.1
+      # Alpha weight on teacher objective when sharing one policy/optimizer.
+      teacher_loss_alpha: 1.0
+      # Student distillation signal is always (teacher_log_probs - student_log_probs).
+      # These knobs control optional GAE smoothing over that signal.
+      # With lambda=0, the student advantage is exactly the immediate on-policy distillation signal.
+      student_gae_lambda: 0.0
+      student_gae_gamma: 1.0
       # ICL context formatting for teacher (reward-before-trajectory format)
       reward_format: "normalized"  # normalize rewards to [0, 1] per group
       sort_context_by_reward: true  # sort context trajectories by reward
@@ -193,6 +200,10 @@ trainer:
   critic_mini_batch_size: 256
   micro_train_batch_size_per_gpu: 1
   micro_forward_batch_size_per_gpu: 1
+  # Teacher-distillation: optional smaller micro batch for teacher training backward (set to 1–2 to avoid OOM)
+  teacher_micro_train_batch_size_per_gpu: null
+  # Teacher-distillation: optional smaller micro batch for teacher forward (ICL sequences are long; set to 1–4 to avoid OOM)
+  teacher_micro_forward_batch_size_per_gpu: null
   update_ref_every_epoch: false
   use_sample_packing: true
   eval_batch_size: 1024

@@ -1,14 +1,13 @@
 """
-Teacher-Distillation: A teacher policy trained with DRO on privileged information
-(on-policy rollouts + rewards), distilled to a student policy.
+Teacher-Distillation: A teacher policy trained with DRO on privileged informatio, then distilled to a student policy.
 
 Training loop:
   1. Student generates N rollouts per prompt.
   2. Environment scores each rollout.
   3. Teacher sees privileged information and computes log-probs on the student's rollout tokens.
   4. Teacher is trained via DRO to maximize environment rewards with regularization to student.
-  5. Student advantages = teacher_log_probs.
-  6. Student is trained on these advantages.
+  5. Student token reward signal = (teacher_log_probs - student_log_probs).
+  6. Student is trained with PPO on teacher-derived advantages.
 
 Usage:
     uv run --isolated --extra vllm -m examples.teacher_distillation.main_teacher_distillation \\
@@ -23,7 +22,6 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import ray
 import torch
-import torch.distributed
 from loguru import logger
 from omegaconf import DictConfig
 
@@ -48,7 +46,6 @@ from skyrl_train.utils.ppo_utils import (
     reduce_loss,
     register_policy_loss,
 )
-from skyrl_train.workers.worker import PolicyWorkerBase
 
 
 @register_policy_loss("dro")
@@ -87,36 +84,61 @@ def dro_policy_loss(
     return loss, 0.0  # no clip ratio for DRO
 
 
-class TeacherWorkerBase(PolicyWorkerBase):
+def compute_student_distillation_gae(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    gamma: float,
+    lambd: float,
+) -> torch.Tensor:
     """
-    Teacher worker: another policy model but trained with DRO loss.
+    GAE-style smoothing using distillation rewards.
+    """
+    with torch.no_grad():
+        lastgaelam = torch.zeros(token_level_rewards.shape[0], device=token_level_rewards.device)
+        advantages_reversed = []
+        gen_len = token_level_rewards.shape[-1]
+
+        for t in reversed(range(gen_len)):
+            reward_t = token_level_rewards[:, t] * response_mask[:, t]
+            lastgaelam = reward_t + gamma * lambd * lastgaelam
+            lastgaelam = lastgaelam * response_mask[:, t]
+            advantages_reversed.append(lastgaelam)
+
+        advantages = torch.stack(advantages_reversed[::-1], dim=1)
+        return advantages * response_mask
+
+
+class SharedTeacherStudentWorker:
+    """
+    A single shared policy model/optimizer that supports two update modes:
+      - student: standard PPO policy update
+      - teacher: DRO update on teacher-conditioned inputs
     """
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        # Override the loss function with the teacher's DRO loss
-        td_cfg = getattr(self.cfg.trainer.algorithm, "teacher_distillation", None)
-        teacher_loss_type = getattr(td_cfg, "teacher_loss_type", "dro") if td_cfg else "dro"
-        self.policy_loss_fn = PolicyLossRegistry.get(teacher_loss_type)
+        td_cfg = getattr(self.cfg.trainer.algorithm, "teacher_distillation", None) or {}
+        teacher_loss_type = getattr(td_cfg, "teacher_loss_type", "dro")
+        self.teacher_policy_loss_fn = PolicyLossRegistry.get(teacher_loss_type)
+        self.teacher_loss_alpha = float(getattr(td_cfg, "teacher_loss_alpha", 1.0))
+        self.training_mode = "student"
 
-    def _normalize_mini_batch_size(self):
-        """Use critic mini-batch size since teacher occupies the critic model slot."""
-        if not hasattr(self, "mesh_rank") or self.mesh_rank is None:
-            raise RuntimeError("mesh_rank must be initialized before calling _normalize_mini_batch_size()")
-        dp_size = self.mesh_rank.dp_size
-        # occupies critic model slot, so use critic mini-batch size
-        self.policy_mini_batch_size_per_gpu = (
-            self.cfg.trainer.critic_mini_batch_size * self.cfg.generator.n_samples_per_prompt // dp_size
-        )
+    def set_training_mode(self, mode: str):
+        if mode not in ("student", "teacher"):
+            raise ValueError(f"Unknown training_mode: {mode}")
+        self.training_mode = mode
 
     def forward_backward(self, experience, accumulation_steps) -> Dict[str, float]:
-        """Teacher forward-backward with DRO loss."""
+        if self.training_mode != "teacher":
+            return super().forward_backward(experience, accumulation_steps)
+
+        # Teacher-mode update on the same policy parameters.
         self.model.train()
         experience.to_device(torch.cuda.current_device())
 
         sequences = experience.sequences
-        old_action_log_probs = experience.action_log_probs  # student's log-probs
-        advantages = experience.advantages  # environment rewards
+        old_action_log_probs = experience.action_log_probs  # detached student log-probs on rollout inputs
+        advantages = experience.advantages  # teacher GRPO advantages
         num_actions = experience.num_actions
         attention_mask = experience.attention_mask
         loss_mask = experience.loss_mask
@@ -131,117 +153,31 @@ class TeacherWorkerBase(PolicyWorkerBase):
                 compute_entropy=True,
                 entropy_requires_grad=False,
             )
-            teacher_loss, _ = self.policy_loss_fn(
+            teacher_loss, _ = self.teacher_policy_loss_fn(
                 action_log_probs,
                 old_action_log_probs,
                 advantages,
                 config=self.cfg.trainer.algorithm,
                 loss_mask=loss_mask,
             )
+            weighted_teacher_loss = self.teacher_loss_alpha * teacher_loss
 
-        # Entropy for logging only (no gradient)
         with torch.no_grad():
             entropy_BS = output["entropy"]
             entropy_BS = entropy_BS[:, -num_actions - 1 : -1]
             entropy = masked_mean(entropy_BS, loss_mask)
 
-        loss = teacher_loss / accumulation_steps
+        loss = weighted_teacher_loss / accumulation_steps
         self.strategy.backward(loss, self.model, self.optimizer)
 
         return {
-            # Teacher-specific metrics
             "teacher_loss": teacher_loss.item(),
+            "teacher_loss_alpha": self.teacher_loss_alpha,
             "teacher_entropy": entropy.item(),
-            # Compatibility keys for ppo_train progress bar
-            "policy_loss": teacher_loss.item(),
+            "policy_loss": weighted_teacher_loss.item(),
             "policy_entropy": entropy.item(),
             "response_length": num_actions,
         }
-
-
-class FSDPTeacherWorkerBase(TeacherWorkerBase):
-    """FSDP-specific teacher worker. Uses critic config for optimizer/FSDP settings."""
-
-    def offload_to_cpu(self, pin_memory=True, non_blocking=True, offload_optimizer=True, offload_model=True):
-        self._set_numa_affinity(torch.distributed.get_rank() % torch.cuda.device_count())
-        self.strategy.offload_to_cpu(
-            self.model, self.optimizer, pin_memory, non_blocking, offload_optimizer, offload_model
-        )
-
-    def backload_to_gpu(self, non_blocking=True, backload_optimizer=True, backload_model=True):
-        self.strategy.backload_to_gpu(self.model, self.optimizer, non_blocking, backload_optimizer, backload_model)
-
-    def init_model(self, model_path, num_training_steps: int = None):
-        from transformers import AutoConfig
-
-        from skyrl_train.distributed.fsdp_strategy import FSDPStrategy
-        from skyrl_train.distributed.fsdp_utils import get_init_weight_context_manager
-        from skyrl_train.model_wrapper import HFModelWrapper
-        from skyrl_train.utils.trainer_utils import get_rope_scaling_config, get_rope_theta_config
-
-        assert self.cfg.trainer.strategy in ("fsdp", "fsdp2")
-
-        # Use *critic* config for optimizer, FSDP, and model settings
-        strategy = FSDPStrategy(
-            fsdp_config=self.cfg.trainer.critic.fsdp_config,
-            optimizer_config=self.cfg.trainer.critic.optimizer_config,
-            fsdp_strategy=self.cfg.trainer.strategy,
-            seed=self.cfg.trainer.seed,
-            micro_train_batch_size_per_gpu=self.cfg.trainer.micro_train_batch_size_per_gpu,
-            num_training_steps=num_training_steps,
-        )
-        strategy.setup_distributed()
-        self.strategy = strategy
-        self._is_lora = self.cfg.trainer.critic.model.lora.rank > 0
-
-        self._normalize_mini_batch_size()
-
-        model_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
-        init_context = get_init_weight_context_manager(
-            use_meta_tensor=not model_config.tie_word_embeddings, mesh=self.strategy.device_mesh
-        )
-
-        with init_context():
-            # Policy architecture (HFModelWrapper) — no value head
-            wrapped_model = HFModelWrapper(
-                model_path,
-                use_flash_attention_2=self.cfg.trainer.flash_attn,
-                bf16=False,  # fp32 for training initialization
-                lora_rank=self.cfg.trainer.critic.model.lora.rank,
-                lora_alpha=self.cfg.trainer.critic.model.lora.alpha,
-                lora_dropout=self.cfg.trainer.critic.model.lora.dropout,
-                target_modules=self.cfg.trainer.critic.model.lora.target_modules,
-                exclude_modules=self.cfg.trainer.critic.model.lora.exclude_modules,
-                sequence_parallel_size=self.cfg.trainer.critic.sequence_parallel_size,
-                use_sample_packing=self.cfg.trainer.use_sample_packing,
-                rope_scaling=get_rope_scaling_config(self.cfg.trainer),
-                rope_theta=get_rope_theta_config(self.cfg.trainer),
-            )
-            self._seq_parallel_monkey_patch(model=wrapped_model.model)
-
-            if self.cfg.trainer.gradient_checkpointing:
-                wrapped_model.gradient_checkpointing_enable(
-                    gradient_checkpointing_kwargs={
-                        "use_reentrant": self.cfg.trainer.gradient_checkpointing_use_reentrant
-                    }
-                )
-
-        self.model, self.optimizer, self.scheduler = strategy.prepare((wrapped_model, None, None))
-        assert (
-            self.optimizer is not None and self.scheduler is not None
-        ), "FSDP preparation should create optimizer and scheduler for teacher"
-
-    def forward(self, data: TrainingInputBatch) -> TrainingOutputBatch:
-        from skyrl_train.distributed.fsdp_utils import fsdp_version
-
-        output = super().forward(data)
-        if self._world_size > 1 and fsdp_version(self.model.model) == 1:
-            self.model.model._handle.reshard(True)
-        return output
-
-
-# Ray remote actor
-TeacherWorker = ray.remote(num_gpus=1)(FSDPTeacherWorkerBase)
 
 
 def format_teacher_context(
@@ -291,11 +227,11 @@ class TeacherDistillationTrainer(RayPPOTrainer):
     @torch.no_grad()
     def fwd_logprobs_values_reward(self, training_input: TrainingInputBatch) -> TrainingInputBatch:
         """
-        Compute log-probs from policy, ref, and teacher models.
+        Compute log-probs from student and teacher models.
 
         Adds to ``training_input``:
           - ``action_log_probs``: student policy log-probs
-          - ``base_action_log_probs``: ref model log-probs (if ref model exists)
+          - ``base_action_log_probs``: student policy log-probs snapshot (used as PPO base policy)
           - ``values``: None (no value function)
           - ``teacher_action_log_probs``: teacher log-probs with privileged context
         """
@@ -308,110 +244,63 @@ class TeacherDistillationTrainer(RayPPOTrainer):
             return ret_outputs[key]
 
         teacher_log_probs = None
-        base_log_probs = None
         action_log_probs = None
 
-        # add privileged information to the teacher's context
-        teacher_fwd_pass = data_fwd_pass
-        if self.critic_model is not None:
-            formatted_sequences, formatted_attention_masks = format_teacher_context(
-                sequences=training_input["sequences"],
-                attention_masks=training_input["attention_mask"],
-                response_masks=training_input["response_mask"],
-                rewards=training_input["rewards"],
-                index=np.array(training_input.metadata["uids"]),
-                tokenizer=self.tokenizer,
-                config=self.cfg.trainer.algorithm,
-                pad_token_id=self.tokenizer.pad_token_id,
-                response_length=training_input.metadata["response_length"],
-            )
-            teacher_fwd_pass = TrainingInputBatch({
-                "sequences": formatted_sequences,
-                "attention_mask": formatted_attention_masks,
-            })
-            teacher_fwd_pass.metadata = {"response_length": training_input.metadata["response_length"]}
+        # Teacher forward is always distinguished by privileged context formatting.
+        formatted_sequences, formatted_attention_masks = format_teacher_context(
+            sequences=training_input["sequences"],
+            attention_masks=training_input["attention_mask"],
+            response_masks=training_input["response_mask"],
+            rewards=training_input["rewards"],
+            index=np.array(training_input.metadata["uids"]),
+            tokenizer=self.tokenizer,
+            config=self.cfg.trainer.algorithm,
+            pad_token_id=self.tokenizer.pad_token_id,
+            response_length=training_input.metadata["response_length"],
+        )
+        teacher_fwd_pass = TrainingInputBatch({
+            "sequences": formatted_sequences,
+            "attention_mask": formatted_attention_masks,
+        })
+        teacher_fwd_pass.metadata = {"response_length": training_input.metadata["response_length"]}
 
-            # Store formatted sequences for teacher training later (move to CPU to save GPU mem)
-            training_input.metadata["teacher_formatted_sequences"] = formatted_sequences.cpu()
-            training_input.metadata["teacher_formatted_attention_mask"] = formatted_attention_masks.cpu()
+        # Store formatted sequences for teacher training later (move to CPU to save GPU mem)
+        training_input.metadata["teacher_formatted_sequences"] = formatted_sequences.cpu()
+        training_input.metadata["teacher_formatted_attention_mask"] = formatted_attention_masks.cpu()
 
-        # forward the teacher model
-        if self.colocate_all and self.critic_model is not None:
-            self.critic_model.backload_to_gpu(backload_optimizer=False, backload_model=True)
-
-        if self.critic_model is not None:
-            teacher_refs = self.critic_model.async_run_ray_method("mesh", "forward", data=teacher_fwd_pass)
-            if self.colocate_all:
-                all_rank_teacher = ray.get(teacher_refs)
-                teacher_log_probs = collect_results(self.critic_model.actor_infos, all_rank_teacher, key="output")
-                self.critic_model.offload_to_cpu(offload_optimizer=False, offload_model=True)
-
-        # forward the ref model (same as base)
-        if self.ref_model is not None:
-            if self.cfg.trainer.placement.colocate_policy_ref or self.colocate_all:
-                self.ref_model.backload_to_gpu()
-            base_action_log_probs_refs = self.ref_model.async_run_ray_method("mesh", "forward", data=data_fwd_pass)
-
-        if self.ref_model is not None:
-            if self.cfg.trainer.placement.colocate_policy_ref or self.colocate_all:
-                all_rank_base_log_probs: List[TrainingOutputBatch] = ray.get(base_action_log_probs_refs)
-                base_log_probs = collect_results(self.ref_model.actor_infos, all_rank_base_log_probs, key="output")
-                self.ref_model.offload_to_cpu()
-                ray.get(self.ref_model.async_run_ray_method("pass_through", "empty_cache"))
-        else:
-            base_log_probs = None
-
-        # forward the student model (same as base)
+        # forward the shared student policy on rollout inputs and teacher-conditioned inputs
         if self.colocate_all:
             self.policy_model.backload_to_gpu(backload_optimizer=False, backload_model=True)
 
         action_log_probs_refs = self.policy_model.async_run_ray_method("mesh", "forward", data=data_fwd_pass)
+        teacher_refs = self.policy_model.async_run_ray_method("mesh", "forward", data=teacher_fwd_pass)
         if self.colocate_all:
             all_rank_action_log_probs: List[TrainingOutputBatch] = ray.get(action_log_probs_refs)
             action_log_probs = collect_results(
                 self.policy_model.actor_infos, all_rank_action_log_probs, key="output"
             )
+            all_rank_teacher = ray.get(teacher_refs)
+            teacher_log_probs = collect_results(self.policy_model.actor_infos, all_rank_teacher, key="output")
             self.policy_model.offload_to_cpu(offload_optimizer=False, offload_model=True)
-
+        
         if not self.colocate_all:
-            if not self.cfg.trainer.placement.colocate_policy_ref:
-                if self.critic_model is not None:
-                    all_rank_teacher = ray.get(teacher_refs)
-                    teacher_log_probs = collect_results(
-                        self.critic_model.actor_infos, all_rank_teacher, key="output"
-                    )
-                if self.ref_model is not None:
-                    all_rank_base_log_probs = ray.get(base_action_log_probs_refs)
-                    base_log_probs = collect_results(
-                        self.ref_model.actor_infos, all_rank_base_log_probs, key="output"
-                    )
-                else:
-                    base_log_probs = None
-            elif self.critic_model is not None:
-                all_rank_teacher = ray.get(teacher_refs)
-                teacher_log_probs = collect_results(
-                    self.critic_model.actor_infos, all_rank_teacher, key="output"
-                )
-
             all_rank_action_log_probs = ray.get(action_log_probs_refs)
             action_log_probs = collect_results(
                 self.policy_model.actor_infos, all_rank_action_log_probs, key="output"
             )
+            all_rank_teacher = ray.get(teacher_refs)
+            teacher_log_probs = collect_results(self.policy_model.actor_infos, all_rank_teacher, key="output")
 
         if not self.colocate_all:
             empty_cache_refs = self.policy_model.async_run_ray_method("pass_through", "empty_cache")
-            if self.ref_model is not None:
-                empty_cache_refs.extend(self.ref_model.async_run_ray_method("pass_through", "empty_cache"))
-            if self.critic_model is not None:
-                empty_cache_refs.extend(self.critic_model.async_run_ray_method("pass_through", "empty_cache"))
             ray.get(empty_cache_refs)
 
         sequences_all = training_input["sequences"]
-        base_log_probs = base_log_probs[: len(sequences_all)] if base_log_probs is not None else None
         action_log_probs = action_log_probs[: len(sequences_all)]
         teacher_log_probs = teacher_log_probs[: len(sequences_all)] if teacher_log_probs is not None else None
 
-        training_input["base_action_log_probs"] = base_log_probs
+        # Ref policy is replaced by student policy snapshot on the rollout inputs.
+        training_input["base_action_log_probs"] = action_log_probs
         training_input["action_log_probs"] = action_log_probs
         training_input["values"] = None  # No value function in teacher-distillation
 
@@ -430,7 +319,7 @@ class TeacherDistillationTrainer(RayPPOTrainer):
         response_mask = data["response_mask"]
         uids = data.metadata["uids"]
 
-        # compute teacher advantages from environment rewards
+        # compute teacher advantages from environment rewards (always GRPO for teacher training)
         teacher_advantages, teacher_returns = compute_grpo_outcome_advantage(
             token_level_rewards=token_level_rewards,
             response_mask=response_mask,
@@ -438,13 +327,30 @@ class TeacherDistillationTrainer(RayPPOTrainer):
             grpo_norm_by_std=self.cfg.trainer.algorithm.grpo_norm_by_std,
         )
 
-        # compute student advantages from teacher log-probs
+        # compute student advantages from teacher-student distillation signal
+        td_cfg = getattr(self.cfg.trainer.algorithm, "teacher_distillation", None) or {}
         teacher_log_probs = data.get("teacher_action_log_probs", None)
-        if teacher_log_probs is not None:
-            student_advantages = teacher_log_probs * response_mask
-        else:
-            # if no teacher, use environment rewards directly
+        student_log_probs = data.get("action_log_probs", None)
+
+        if teacher_log_probs is None:
+            # no teacher: student uses env rewards (same as teacher advantages)
             student_advantages = teacher_advantages
+        else:
+            if student_log_probs is None:
+                raise ValueError(
+                    "Teacher distillation student advantages require `action_log_probs` (student policy), "
+                    "but student log-probs are missing."
+                )
+            distill_token_rewards = (teacher_log_probs - student_log_probs) * response_mask
+            # Optional GAE smoothing over (teacher-student); lambda=0 is exact immediate token signal.
+            gamma = getattr(td_cfg, "student_gae_gamma", getattr(self.cfg.trainer.algorithm, "gamma", 1.0))
+            lambd = getattr(td_cfg, "student_gae_lambda", 0.0)
+            student_advantages = compute_student_distillation_gae(
+                token_level_rewards=distill_token_rewards,
+                response_mask=response_mask,
+                gamma=gamma,
+                lambd=lambd,
+            )
 
         data["advantages"] = student_advantages
         data["returns"] = student_advantages  # no value-function returns
@@ -506,7 +412,7 @@ class TeacherDistillationTrainer(RayPPOTrainer):
         })
         if teacher_log_probs is not None:
             teacher_lp_cpu = data["teacher_action_log_probs"]
-            student_lp_cpu = data["action_log_probs"]
+            student_lp_cpu = data.get("action_log_probs", None)
             if teacher_lp_cpu is not None and student_lp_cpu is not None:
                 kl_signal = (teacher_lp_cpu - student_lp_cpu) * data["response_mask"]
                 valid_kl = torch.masked_select(
@@ -514,54 +420,33 @@ class TeacherDistillationTrainer(RayPPOTrainer):
                     data["response_mask"][: num_samples - pad_size].bool(),
                 )
                 self.all_metrics.update({
-                    "teacher/avg_reverse_kl": valid_kl.mean().item(),
+                    "student/avg_teacher_minus_student_logp": valid_kl.mean().item(),
                 })
 
         return data
 
-    def train_critic_and_policy(self, data: TrainingInputBatch):
-        """
-        Train the teacher with DRO on environment rewards, then train the student
-        policy with PPO on teacher-distillation advantages.
-        """
+    def train_teacher_and_student(self, data: TrainingInputBatch):
+        """Train teacher and student objectives sequentially on one shared policy model."""
         data.metadata["global_step"] = self.global_step
 
         teacher_data = self._build_teacher_training_batch(data)
         student_data = self._build_student_training_batch(data)
 
         if self.colocate_all:
-            if self.critic_model is not None:
-                with Timer("teacher_train", self.all_timings):
-                    self.critic_model.backload_to_gpu()
-                    teacher_statuses = ray.get(
-                        self.critic_model.async_run_ray_method("mesh", "ppo_train", teacher_data)
-                    )
-                    self.critic_model.offload_to_cpu()
-            with Timer("policy_train", self.all_timings):
-                self.policy_model.backload_to_gpu()
-                policy_statuses = ray.get(
-                    self.policy_model.async_run_ray_method("mesh", "ppo_train", student_data)
-                )
-        else:
-            # Overlapped: teacher and student in parallel
-            if self.critic_model is not None:
-                with Timer("policy_teacher_overlap_train", self.all_timings):
-                    policy_refs = self.policy_model.async_run_ray_method("mesh", "ppo_train", student_data)
-                    teacher_refs = self.critic_model.async_run_ray_method("mesh", "ppo_train", teacher_data)
-                    policy_statuses = ray.get(policy_refs)
-                    teacher_statuses = ray.get(teacher_refs)
-            else:
-                with Timer("policy_train", self.all_timings):
-                    policy_statuses = ray.get(
-                        self.policy_model.async_run_ray_method("mesh", "ppo_train", student_data)
-                    )
+            self.policy_model.backload_to_gpu()
+
+        with Timer("teacher_train", self.all_timings):
+            ray.get(self.policy_model.async_run_ray_method("pass_through", "set_training_mode", "teacher"))
+            teacher_statuses = ray.get(self.policy_model.async_run_ray_method("mesh", "ppo_train", teacher_data))
+
+        with Timer("policy_train", self.all_timings):
+            ray.get(self.policy_model.async_run_ray_method("pass_through", "set_training_mode", "student"))
+            policy_statuses = ray.get(self.policy_model.async_run_ray_method("mesh", "ppo_train", student_data))
 
         empty_cache_refs = []
-        if self.critic_model is not None:
-            teacher_status = teacher_statuses[0].metadata["train_status"]
-            for k, v in teacher_status.items():
-                self.all_metrics.update({f"teacher/{k}": v})
-            empty_cache_refs += self.critic_model.async_run_ray_method("pass_through", "empty_cache")
+        teacher_status = teacher_statuses[0].metadata["train_status"]
+        for k, v in teacher_status.items():
+            self.all_metrics.update({f"teacher/{k}": v})
 
         policy_status = policy_statuses[0].metadata["train_status"]
         for k, v in policy_status.items():
@@ -570,6 +455,13 @@ class TeacherDistillationTrainer(RayPPOTrainer):
         ray.get(empty_cache_refs)
 
         return policy_status
+
+    def train_critic_and_policy(self, data: TrainingInputBatch):
+        """
+        Compatibility override for RayPPOTrainer's call site.
+        This trainer does not use a critic; delegate to train_teacher_and_student.
+        """
+        return self.train_teacher_and_student(data)
 
     def _build_teacher_training_batch(self, data: TrainingInputBatch) -> TrainingInputBatch:
         """
@@ -581,16 +473,17 @@ class TeacherDistillationTrainer(RayPPOTrainer):
         teacher_sequences = data.metadata.get("teacher_formatted_sequences")
         teacher_attention_mask = data.metadata.get("teacher_formatted_attention_mask")
 
-        if teacher_sequences is None:
-            # Fallback: use original sequences (no context)
-            logger.warning("No teacher-formatted sequences found; using original sequences for teacher training.")
-            teacher_sequences = data["sequences"]
-            teacher_attention_mask = data["attention_mask"]
+        if teacher_sequences is None or teacher_attention_mask is None:
+            raise RuntimeError(
+                "Teacher training requires teacher-formatted context sequences, but they were not found in metadata."
+            )
 
         teacher_batch = TrainingInputBatch({
             "sequences": teacher_sequences,
             "attention_mask": teacher_attention_mask,
-            "action_log_probs": data["action_log_probs"],        # student's log-probs (for DRO penalty)
+            # KL term compares two passes from same shared policy:
+            # teacher pass uses context-formatted inputs; this ref pass uses normal student inputs.
+            "action_log_probs": data["action_log_probs"],
             "base_action_log_probs": None,                       # teacher has no ref model
             "values": None,                                      # no value function
             "returns": data["teacher_returns"],                  # GRPO returns
@@ -609,7 +502,7 @@ class TeacherDistillationTrainer(RayPPOTrainer):
         """
         Build a TrainingInputBatch for student policy training with:
         - Original sequences (no privileged context)
-        - Teacher-distillation advantages (reverse KL)
+        - Teacher-distillation advantages (default: teacher_log_probs - student_log_probs)
         """
         student_batch = TrainingInputBatch({
             "sequences": data["sequences"],
@@ -639,7 +532,7 @@ class TeacherDistillationExp(BasePPOExp):
         return TeacherDistillationTrainer(*args, **kwargs)
 
     def _setup_trainer(self):
-        """Override to use TeacherWorker in place of CriticWorker."""
+        """Override to run teacher+student updates on one shared policy worker."""
         logger.info(self.get_cfg_as_str(self.cfg))
         os.makedirs(self.cfg.trainer.export_path, exist_ok=True)
         os.makedirs(self.cfg.trainer.ckpt_path, exist_ok=True)
@@ -653,6 +546,14 @@ class TeacherDistillationExp(BasePPOExp):
             from skyrl_train.workers.megatron.megatron_worker import PolicyWorker, RefWorker
         else:
             raise ValueError(f"Unknown strategy type: {self.cfg.trainer.strategy}")
+
+        class SharedPolicyWorker(SharedTeacherStudentWorker, PolicyWorker):
+            pass
+
+        # Disable separate teacher/critic model; teacher objective runs on policy_model in teacher mode.
+        self.cfg.trainer.critic.model.path = None
+        # Reference policy is replaced by student policy snapshot in this setup.
+        self.cfg.trainer.algorithm.use_kl_loss = False
 
         tracker = self.get_tracker()
         tokenizer = self.tokenizer
@@ -678,8 +579,8 @@ class TeacherDistillationExp(BasePPOExp):
             colocate_pg=self.colocate_pg,
         )
 
-        # Build models: use TeacherWorker in place of CriticWorker
-        trainer.build_models(PolicyWorker, TeacherWorker, RefWorker)
+        # Build models: use one shared policy worker for both teacher and student phases.
+        trainer.build_models(SharedPolicyWorker, SharedPolicyWorker, RefWorker)
         return trainer
 
 

@@ -313,6 +313,17 @@ class RayPPOTrainer:
                     self.global_step % self.cfg.trainer.eval_interval == 0
                     or self.global_step == self.total_training_steps
                 ):
+                    # Sync policy (student) weights to inference engines immediately before eval so
+                    # eval uses the latest trained model (avoids stale eval metrics when colocate_all
+                    # or async behavior could otherwise leave inference engines with older weights).
+                    if self.colocate_all:
+                        self.policy_model.backload_to_gpu(backload_optimizer=False, backload_model=True)
+                        asyncio.run(self.inference_engine_client.wake_up(tags=["weights"]))
+                    with Timer("sync_weights_before_eval", self.all_timings):
+                        ray.get(self.sync_policy_weights_to_inference_engines())
+                    if self.colocate_all:
+                        self.policy_model.offload_to_cpu(offload_optimizer=False, offload_model=True)
+                        asyncio.run(self.inference_engine_client.wake_up(tags=["kv_cache"]))
                     with Timer("eval", self.all_timings):
                         eval_metrics = asyncio.run(self.eval())
                         self.all_metrics.update(eval_metrics)
@@ -873,38 +884,12 @@ class RayPPOTrainer:
         action_log_probs = None
         values = None
 
-        # For ICVL, the critic gets additional trajectories + rewards from the same prompt (group)
-        # to estimate value_refs for only the trajectory at-hand. Ref and policy use original data.
-        critic_fwd_pass = data_fwd_pass
-        if self.critic_model is not None and self.cfg.trainer.algorithm.advantage_estimator == "icvl":
-            from skyrl_train.utils.icvl_utils import format_icvl_batch_with_context
-
-            # Format sequences with ICVL context: [prompt]+ [other_responses + rewards] + [current_response].
-            # The critic still predicts one value per token for the current response only.
-            formatted_sequences, formatted_attention_masks = format_icvl_batch_with_context(
-                sequences=training_input["sequences"],
-                attention_masks=training_input["attention_mask"],
-                response_masks=training_input["response_mask"],
-                rewards=training_input["rewards"],
-                index=np.array(training_input.metadata["uids"]),
-                tokenizer=self.tokenizer,
-                config=self.cfg.trainer.algorithm,
-                pad_token_id=self.tokenizer.pad_token_id,
-                response_length=training_input.metadata["response_length"],
-            )
-
-            critic_fwd_pass = TrainingInputBatch({
-                "sequences": formatted_sequences,
-                "attention_mask": formatted_attention_masks,
-            })
-            critic_fwd_pass.metadata = {"response_length": training_input.metadata["response_length"]}
-
-        # calculate critic values (ICVL: uses context-formatted batch; else: same as ref/policy)
+        # calculate critic values
         if self.colocate_all and self.critic_model is not None:
             self.critic_model.backload_to_gpu(backload_optimizer=False, backload_model=True)
 
         if self.critic_model is not None:
-            value_refs = self.critic_model.async_run_ray_method("mesh", "forward", data=critic_fwd_pass)
+            value_refs = self.critic_model.async_run_ray_method("mesh", "forward", data=data_fwd_pass)
             if self.colocate_all:
                 all_rank_values = ray.get(value_refs)
                 values = collect_results(self.critic_model.actor_infos, all_rank_values, key="output")

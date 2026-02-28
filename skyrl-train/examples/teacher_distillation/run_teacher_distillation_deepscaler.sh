@@ -15,42 +15,62 @@ set -x
 # --- Configurable env vars with defaults ---
 : "${DATA_DIR:="$HOME/data/deepscaler"}"
 : "${MODEL_NAME:="Qwen/Qwen3-1.7B"}"
-: "${NUM_GPUS:=4}"
+: "${NUM_GPUS:=8}"
 : "${LOGGER:=wandb}"
 : "${INFERENCE_BACKEND:=vllm}"
 
 # --- Training hyperparameters ---
 : "${TRAIN_BATCH_SIZE:=1024}"
-: "${POLICY_MINI_BATCH_SIZE:=256}"
-: "${CRITIC_MINI_BATCH_SIZE:=256}"
-: "${N_SAMPLES_PER_PROMPT:=8}"
+: "${POLICY_MINI_BATCH_SIZE:=512}"
+: "${CRITIC_MINI_BATCH_SIZE:=512}"
+: "${N_SAMPLES_PER_PROMPT:=4}"
 : "${MAX_PROMPT_LENGTH:=1024}"
-: "${MAX_RESPONSE_LENGTH:=2048}"
+: "${MAX_RESPONSE_LENGTH:=8196}"
 : "${POLICY_LR:=1e-6}"
 : "${TEACHER_LR:=1e-6}"
 : "${EPOCHS:=20}"
-: "${KL_LOSS_COEF:=0.001}"
+
+# Set to "true" to enable thinking, "false" to disable. Empty = model default (usually true).
+: "${ENABLE_THINKING:=}"
+if [ -n "$ENABLE_THINKING" ]; then
+  : "${BATCHED:=false}"
+else
+  : "${BATCHED:=true}"
+fi
 
 # --- Teacher-distillation-specific parameters ---
 # teacher_loss_type: "dro" for Distributionally Robust Optimization
 : "${TEACHER_LOSS_TYPE:=dro}"
 # dro_beta: quadratic regularization coefficient (higher = teacher stays closer to student)
 : "${DRO_BETA:=0.1}"
+# teacher loss alpha: scales teacher update magnitude relative to student PPO update
+: "${TEACHER_LOSS_ALPHA:=1.0}"
 # reward_format: "normalized" normalizes rewards to [0, 1] per group; "raw" keeps them as-is
-: "${TD_REWARD_FORMAT:=normalized}"
+: "${TD_REWARD_FORMAT:=raw}"
 # sort_context_by_reward: sort context trajectories by reward for better ICL pattern learning
 : "${TD_SORT_CONTEXT:=true}"
 # sort_order: "ascending" (worst to best) or "descending" (best to worst)
 : "${TD_SORT_ORDER:=ascending}"
 # reward_precision: number of decimal places for reward formatting in context
 : "${TD_REWARD_PRECISION:=2}"
+# Student distillation signal is always (teacher_log_probs - student_log_probs).
+# GAE smoothing is controlled by STUDENT_GAE_LAMBDA/GAMMA.
+# With STUDENT_GAE_LAMBDA=0, this is exactly immediate on-policy distillation.
+: "${STUDENT_GAE_LAMBDA:=0.0}"
+: "${STUDENT_GAE_GAMMA:=1.0}"
+# teacher_micro_forward_batch_size_per_gpu: teacher forward on long ICL sequences; use smaller micro batch to avoid OOM
+: "${TEACHER_MICRO_FORWARD_BATCH_SIZE_PER_GPU:=2}"
+# teacher_micro_train_batch_size_per_gpu: teacher training backward on long ICL sequences
+: "${TEACHER_MICRO_TRAIN_BATCH_SIZE_PER_GPU:=2}"
 
 uv run --isolated --extra $INFERENCE_BACKEND -m examples.teacher_distillation.main_teacher_distillation \
   data.train_data="['$DATA_DIR/train.parquet']" \
   data.val_data="['$DATA_DIR/validation.parquet']" \
-  trainer.algorithm.advantage_estimator="grpo" \
   trainer.algorithm.teacher_distillation.teacher_loss_type="$TEACHER_LOSS_TYPE" \
   trainer.algorithm.teacher_distillation.dro_beta=$DRO_BETA \
+  trainer.algorithm.teacher_distillation.teacher_loss_alpha=$TEACHER_LOSS_ALPHA \
+  trainer.algorithm.teacher_distillation.student_gae_lambda=$STUDENT_GAE_LAMBDA \
+  trainer.algorithm.teacher_distillation.student_gae_gamma=$STUDENT_GAE_GAMMA \
   trainer.algorithm.teacher_distillation.reward_format="$TD_REWARD_FORMAT" \
   trainer.algorithm.teacher_distillation.sort_context_by_reward=$TD_SORT_CONTEXT \
   trainer.algorithm.teacher_distillation.sort_order="$TD_SORT_ORDER" \
@@ -69,21 +89,22 @@ uv run --isolated --extra $INFERENCE_BACKEND -m examples.teacher_distillation.ma
   trainer.train_batch_size=$TRAIN_BATCH_SIZE \
   trainer.policy_mini_batch_size=$POLICY_MINI_BATCH_SIZE \
   trainer.critic_mini_batch_size=$CRITIC_MINI_BATCH_SIZE \
-  trainer.micro_forward_batch_size_per_gpu=64 \
-  trainer.micro_train_batch_size_per_gpu=64 \
+  trainer.micro_forward_batch_size_per_gpu=8 \
+  trainer.micro_train_batch_size_per_gpu=8 \
+  trainer.teacher_micro_forward_batch_size_per_gpu=$TEACHER_MICRO_FORWARD_BATCH_SIZE_PER_GPU \
+  trainer.teacher_micro_train_batch_size_per_gpu=$TEACHER_MICRO_TRAIN_BATCH_SIZE_PER_GPU \
   trainer.ckpt_interval=10 \
   trainer.max_prompt_length=$MAX_PROMPT_LENGTH \
   generator.sampling_params.max_generate_length=$MAX_RESPONSE_LENGTH \
   trainer.policy.optimizer_config.lr=$POLICY_LR \
   trainer.critic.optimizer_config.lr=$TEACHER_LR \
-  trainer.algorithm.use_kl_loss=true \
-  trainer.algorithm.kl_loss_coef=$KL_LOSS_COEF \
   generator.backend=$INFERENCE_BACKEND \
   generator.run_engines_locally=true \
   generator.weight_sync_backend=nccl \
   generator.async_engine=true \
-  generator.batched=true \
+  generator.batched=$BATCHED \
   environment.env_class=aime \
+  +environment.skyrl_gym.aime.strict_box_verify=${STRICT_BOX_VERIFY:-true} \
   generator.n_samples_per_prompt=$N_SAMPLES_PER_PROMPT \
   generator.gpu_memory_utilization=0.8 \
   trainer.logger="$LOGGER" \
@@ -94,4 +115,6 @@ uv run --isolated --extra $INFERENCE_BACKEND -m examples.teacher_distillation.ma
   trainer.eval_batch_size=1024 \
   trainer.eval_before_train=true \
   trainer.eval_interval=5 \
-  $@
+  ${ENABLE_THINKING:++generator.chat_template_kwargs={enable_thinking:$ENABLE_THINKING}} \
+  "${EXTRA_OVERRIDES[@]}" \
+  "$@"
