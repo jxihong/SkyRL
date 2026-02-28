@@ -895,6 +895,7 @@ class RayPPOTrainer:
                 config=self.cfg.trainer.algorithm,
                 pad_token_id=self.tokenizer.pad_token_id,
                 response_length=original_response_length,
+                use_zip_format=getattr(self.cfg.trainer.algorithm, "value_head_type", "regression") == "zip",
             )
 
             critic_fwd_pass = TrainingInputBatch({
@@ -902,6 +903,10 @@ class RayPPOTrainer:
                 "attention_mask": formatted_attention_masks,
             })
             critic_fwd_pass.metadata = {"response_length": original_response_length}
+
+            # Cache for critic training so it trains on the same context-formatted input
+            training_input["icvl_critic_sequences"] = formatted_sequences
+            training_input["icvl_critic_attention_mask"] = formatted_attention_masks
 
         # calculate critic values (ICVL: uses context-formatted batch; else: same as ref/policy)
         if self.colocate_all and self.critic_model is not None:
@@ -1063,13 +1068,28 @@ class RayPPOTrainer:
     def train_critic_and_policy(self, data: TrainingInputBatch):
         """
         Run the training step for the policy and critic models (this is overlapped if colocate_all is False).
+
+        For ICVL, the critic trains on context-formatted sequences (matching its
+        inference input) while the policy trains on the original sequences.
         """
         data.metadata["global_step"] = self.global_step
+
+        # Build separate critic batch with ICVL-formatted sequences when available.
+        # Pop the cached tensors from `data` so the policy never sees them.
+        critic_data = data
+        if "icvl_critic_sequences" in data:
+            icvl_seqs = data.pop("icvl_critic_sequences")
+            icvl_attn = data.pop("icvl_critic_attention_mask")
+            critic_data = TrainingInputBatch({k: v for k, v in data.items()})
+            critic_data["sequences"] = icvl_seqs
+            critic_data["attention_mask"] = icvl_attn
+            critic_data.metadata = data.metadata
+
         if self.colocate_all:
             if self.critic_model is not None:
                 with Timer("critic_train", self.all_timings):
                     self.critic_model.backload_to_gpu()
-                    critic_statuses = ray.get(self.critic_model.async_run_ray_method("mesh", "ppo_train", data))
+                    critic_statuses = ray.get(self.critic_model.async_run_ray_method("mesh", "ppo_train", critic_data))
                     self.critic_model.offload_to_cpu()
             with Timer("policy_train", self.all_timings):
                 self.policy_model.backload_to_gpu()
@@ -1078,7 +1098,7 @@ class RayPPOTrainer:
             if self.critic_model is not None:
                 with Timer("policy_critic_overlap_train", self.all_timings):
                     policy_refs = self.policy_model.async_run_ray_method("mesh", "ppo_train", data)
-                    critic_refs = self.critic_model.async_run_ray_method("mesh", "ppo_train", data)
+                    critic_refs = self.critic_model.async_run_ray_method("mesh", "ppo_train", critic_data)
                     policy_statuses = ray.get(policy_refs)
                     critic_statuses = ray.get(critic_refs)
             else:

@@ -9,7 +9,7 @@ current response.
 """
 
 from collections import defaultdict
-from typing import Any, List, Tuple
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 import torch
@@ -24,6 +24,130 @@ def _encode_text(text: str, tokenizer: Any, pad_token_id: int, max_tokens: int =
     return ids[:max_tokens]
 
 
+def _get_zip_template_tokens(tokenizer: Any) -> Dict[str, Any]:
+    """Derive chat template structural tokens from the tokenizer.
+
+    Uses ``apply_chat_template`` with minimal probe messages so the result
+    is correct for any model family (Qwen, Llama, Gemma, …).
+
+    Returns a dict with:
+        assistant_header  – token ids that open an assistant turn
+        eos_token_id      – single token id that closes an assistant turn
+        user_header       – token ids that open a user turn (after a prior assistant turn)
+        user_footer       – token ids that close a user turn
+    """
+    base = tokenizer.apply_chat_template(
+        [{"role": "user", "content": "x"}],
+        tokenize=True, add_generation_prompt=False,
+    )
+    with_gen = tokenizer.apply_chat_template(
+        [{"role": "user", "content": "x"}],
+        tokenize=True, add_generation_prompt=True,
+    )
+    assistant_header = list(with_gen[len(base):])
+
+    one_asst = tokenizer.apply_chat_template(
+        [{"role": "user", "content": "x"}, {"role": "assistant", "content": "y"}],
+        tokenize=True, add_generation_prompt=False,
+    )
+    two_turn = tokenizer.apply_chat_template(
+        [{"role": "user", "content": "x"}, {"role": "assistant", "content": "y"},
+         {"role": "user", "content": "z"}],
+        tokenize=True, add_generation_prompt=False,
+    )
+
+    # --- eos_token_id: first token after assistant content in a completed turn ---
+    y_tokens = tokenizer.encode("y", add_special_tokens=False)
+    after_asst_content = list(one_asst[len(base) + len(assistant_header) + len(y_tokens):])
+    eos_token_id = after_asst_content[0] if after_asst_content else tokenizer.eos_token_id
+
+    # --- user header / footer: structural tokens around the second user message ---
+    second_user = list(two_turn[len(one_asst):])
+    z_tokens = tokenizer.encode("z", add_special_tokens=False)
+    z_start = None
+    for idx in range(len(second_user) - len(z_tokens) + 1):
+        if second_user[idx : idx + len(z_tokens)] == z_tokens:
+            z_start = idx
+            break
+    if z_start is not None:
+        user_header = second_user[:z_start]
+        user_footer = second_user[z_start + len(z_tokens):]
+    else:
+        user_header = []
+        user_footer = []
+
+    return {
+        "assistant_header": assistant_header,
+        "eos_token_id": eos_token_id,
+        "user_header": user_header,
+        "user_footer": user_footer,
+    }
+
+
+def _build_zip_context_tokens(
+    prompt_toks: List[int],
+    others: List[int],
+    response_tokens: torch.Tensor,
+    response_masks: torch.Tensor,
+    raw_scalar_rewards: torch.Tensor,
+    target_response_toks: List[int],
+    tokenizer: Any,
+    tmpl: Dict[str, Any],
+) -> List[int]:
+    """Build token sequence matching the zip critic training format.
+
+    The format mirrors ``train_in_context_critic.py``::
+
+        {user_header}{prompt}{user_footer}
+        {assistant_header}{resp_1}{eos}
+        {user_header}Reward: {r}\\nLength: {l} tokens{user_footer}
+        ...
+        {assistant_header}{target_resp}
+
+    ``tmpl`` is the dict returned by :func:`_get_zip_template_tokens`.
+    """
+    assistant_header = tmpl["assistant_header"]
+    eos_token_id = tmpl["eos_token_id"]
+    user_header = tmpl["user_header"]
+    user_footer = tmpl["user_footer"]
+
+    toks: List[int] = []
+
+    # Prompt: strip trailing assistant header that the RL chat template appends,
+    # since each response carries its own assistant header in the training format.
+    hlen = len(assistant_header)
+    if hlen and len(prompt_toks) >= hlen and prompt_toks[-hlen:] == assistant_header:
+        toks.extend(prompt_toks[:-hlen])
+    else:
+        toks.extend(prompt_toks)
+
+    for j in others:
+        resp_len_j = int(response_masks[j].sum().item())
+        resp_toks = response_tokens[j, :resp_len_j].tolist()
+
+        has_eos = resp_toks and resp_toks[-1] == eos_token_id
+        footer = [] if has_eos else [eos_token_id]
+        content_plus_footer_len = len(resp_toks) + len(footer)
+
+        # Assistant message (no trailing tokens after eos — matches training traj_block)
+        toks.extend(assistant_header)
+        toks.extend(resp_toks)
+        toks.extend(footer)
+
+        # User feedback message
+        r = raw_scalar_rewards[j].item()
+        feedback_str = f"Reward: {r}\nLength: {content_plus_footer_len} tokens"
+        feedback_toks = tokenizer.encode(feedback_str, add_special_tokens=False)
+        toks.extend(user_header)
+        toks.extend(feedback_toks)
+        toks.extend(user_footer)
+
+    # Target response: re-add assistant header, then raw response tokens
+    toks.extend(assistant_header)
+    toks.extend(target_response_toks)
+    return toks
+
+
 def format_icvl_batch_with_context(
     sequences: torch.Tensor,
     attention_masks: torch.Tensor,
@@ -34,33 +158,29 @@ def format_icvl_batch_with_context(
     config: DictConfig,
     pad_token_id: int,
     response_length: int,
+    use_zip_format: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Build critic input with in-context (response, reward) examples from the same prompt.
 
-    For each sample *i* in the batch we construct:
+    When ``use_zip_format=False`` (default), uses the plain-text ICVL format:
 
-        [prompt_i]                                       (original prompt, left-pad preserved)
-        Response 1: [resp_j1]
-        [Reward 1: r_j1]      
-        Response 2: [resp_j2]
-        [Reward 2: r_j2] 
+        [prompt]
+        Response 1: [resp_1]  
+        Reward 1: [r_1]
         ...
-        [resp_i]                                         (current response — NO prefix)
+        [target_resp]
 
-    Args:
-        sequences:       (B, seq_len)             full sequences [prompt | response].
-        attention_masks: (B, seq_len)             1 for real tokens, 0 for padding.
-        response_masks:  (B, response_length)     1 for real response tokens, 0 for pad.
-        rewards:         (B, response_length)     per-token rewards.
-        index:           (B,)                     prompt/group id (same id → same prompt).
-        tokenizer:       HF tokenizer.
-        config:          ``cfg.trainer.algorithm`` — reads ``config.icvl.*``.
-        pad_token_id:    padding token id.
-        response_length: padded response length (= ``response_masks.shape[1]``).
+    When ``use_zip_format=True``, uses the model's chat template (derived
+    from the tokenizer) to match the format used by the ZIP training:
 
-    Returns:
-        formatted_sequences:        (B, new_seq_len)  left-padded to common length.
-        formatted_attention_masks:  (B, new_seq_len)
+        {user turn: [prompt]}
+        {assistant turn: [resp_1]}{eos}
+        {user turn: Reward: [r_1]\\nLength: [l_1] tokens}
+        ...
+        {assistant turn: [target_resp]}
+
+    In both modes the last ``response_length`` tokens are the target response,
+    preserving value-head alignment.
     """
     device = sequences.device
     batch_size, seq_len = sequences.shape
@@ -74,10 +194,11 @@ def format_icvl_batch_with_context(
     reward_precision = int(getattr(icvl_cfg, "reward_precision", 4))
 
     # ---- scalar reward per response ----
-    scalar_rewards = (rewards.float() * response_masks.float()).sum(dim=-1)  # (B,)
+    raw_scalar_rewards = (rewards.float() * response_masks.float()).sum(dim=-1)  # (B,)
+    scalar_rewards = raw_scalar_rewards
 
-    # ---- optional: normalize per group to [0, 1] ----
-    if reward_format == "normalized":
+    # ---- optional: normalize per group to [0, 1] (only for plain-text format) ----
+    if reward_format == "normalized" and not use_zip_format:
         id2rows: defaultdict[str, List[int]] = defaultdict(list)
         for i in range(batch_size):
             id2rows[index[i]].append(i)
@@ -100,47 +221,55 @@ def format_icvl_batch_with_context(
         id2rows_all[index[i]].append(i)
 
     # ---- per-row prompt boundaries (strip left-padding) ----
-    # Find the first real token per row so we only include actual prompt tokens.
-    prompt_attn_mask = attention_masks[:, :prompt_len]             # (B, prompt_len)
-    # first_real[i] = index of first attn==1 token in the prompt region
-    # If the entire prompt region is padding (shouldn't happen), default to prompt_len.
+    prompt_attn_mask = attention_masks[:, :prompt_len]              # (B, prompt_len)
     has_prompt = prompt_attn_mask.any(dim=1)                        # (B,)
     prompt_start_idx = torch.where(
         has_prompt,
-        prompt_attn_mask.int().argmax(dim=1),                     # first 1
+        prompt_attn_mask.int().argmax(dim=1),
         torch.full((batch_size,), prompt_len, device=device),
     )  # (B,)
 
     response_tokens = sequences[:, -response_length:]               # (B, response_length)
 
+    # Derive chat template tokens once for the whole batch
+    zip_tmpl = _get_zip_template_tokens(tokenizer) if use_zip_format else None
+
     all_tokens: List[List[int]] = []
     for i in range(batch_size):
         others = [j for j in id2rows_all[index[i]] if j != i]
 
-        # Sort context examples by reward for better ICL pattern recognition
         if sort_context and len(others) > 1:
             others.sort(key=lambda j: scalar_rewards[j].item(), reverse=(sort_order == "descending"))
 
-        # -- prompt (stripped of left-padding — only real tokens) --
         start = prompt_start_idx[i].item()
-        toks: List[int] = sequences[i, start:prompt_len].tolist()
+        prompt_toks: List[int] = sequences[i, start:prompt_len].tolist()
 
-        # -- ICL context: (response, reward) pairs --
-        for ctx_num, j in enumerate(others, start=1):
-            toks.extend(_encode_text(f"\nResponse {ctx_num}: ", tokenizer, pad_token_id))
-            toks.extend(response_tokens[j].tolist())
-            r = scalar_rewards[j].item()
-            toks.extend(_encode_text(
-                f"\n[Reward {ctx_num}: {r:.{reward_precision}f}]", tokenizer, pad_token_id
-            ))
+        if use_zip_format:
+            toks = _build_zip_context_tokens(
+                prompt_toks=prompt_toks,
+                others=others,
+                response_tokens=response_tokens,
+                response_masks=response_masks,
+                raw_scalar_rewards=raw_scalar_rewards,
+                target_response_toks=response_tokens[i].tolist(),
+                tokenizer=tokenizer,
+                tmpl=zip_tmpl,
+            )
+        else:
+            toks = list(prompt_toks)
+            for ctx_num, j in enumerate(others, start=1):
+                resp_len_j = int(response_masks[j].sum().item())
+                toks.extend(_encode_text(f"\nResponse {ctx_num}: ", tokenizer, pad_token_id))
+                toks.extend(response_tokens[j, :resp_len_j].tolist())
+                r = scalar_rewards[j].item()
+                toks.extend(
+                    _encode_text(f"\nReward {ctx_num}: {r:.{reward_precision}f}", tokenizer, pad_token_id)
+                )
+            toks.extend(response_tokens[i].tolist())
 
-        # -- current response (NO prefix so last response_length tokens align exactly) --
-        toks.extend(response_tokens[i].tolist())
         all_tokens.append(toks)
 
     # ---- left-pad to common length ----
-    # Every appended token is real (prompt padding was stripped), so attention mask
-    # is simply 1 for token positions and 0 for left-pad.
     max_len = max(len(t) for t in all_tokens)
 
     out_seqs = torch.full((batch_size, max_len), pad_token_id, dtype=sequences.dtype, device=device)

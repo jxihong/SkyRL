@@ -46,15 +46,24 @@ set -x
 : "${ICVL_SORT_ORDER:=ascending}"
 # reward_precision: number of decimal places for reward formatting in context
 : "${ICVL_REWARD_PRECISION:=2}"
+# micro batch size for critic training (smaller than policy to handle longer ICVL sequences)
+: "${MICRO_CRITIC_TRAIN_BS:=2}"
 
-# --- Value head type: regression (default), cross_entropy (bins), or sigmoid (binary BCE) ---
+# --- Value head type: regression (default), cross_entropy (bins), sigmoid (binary BCE), or zip (joint distribution) ---
 # USE_CE_VALUE_HEAD=true: critic predicts reward (cross-entropy). Uses VALUE_MIN, VALUE_MAX, VALUE_NUM_BINS.
 # USE_SIGMOID_VALUE_HEAD=true: critic predicts binary reward (BCE) with classes VALUE_MIN, VALUE_MAX.
 : "${USE_CE_VALUE_HEAD:=false}"
-: "${USE_SIGMOID_VALUE_HEAD:=true}"
+: "${USE_SIGMOID_VALUE_HEAD:=false}"
 : "${VALUE_MIN:=-1.0}"
 : "${VALUE_MAX:=1.0}"
 : "${VALUE_NUM_BINS:=51}"
+# USE_ZIP_VALUE_HEAD=true: critic uses ZIP to predict joint distribution of reward and length.
+# can load from pretrained critic using ZIP_CRITIC_PATH.
+: "${USE_ZIP_VALUE_HEAD:=true}"
+: "${ZIP_CRITIC_PATH:=}"
+: "${ZIP_DISTRIBUTION_TOKEN_ID:=151669}"
+: "${ZIP_REWARD_VALUES:=[-1.0,1.0]}"
+: "${ZIP_NUM_LENGTH_BINS:=8}"
 
 # Set to "true" to enable thinking, "false" to disable. Empty = model default (usually true).
 : "${ENABLE_THINKING:=}"
@@ -89,6 +98,7 @@ _run_common() {
     trainer.critic_mini_batch_size=$CRITIC_MINI_BATCH_SIZE \
     trainer.micro_forward_batch_size_per_gpu=8 \
     trainer.micro_train_batch_size_per_gpu=8 \
+    trainer.micro_critic_train_batch_size_per_gpu=$MICRO_CRITIC_TRAIN_BS \
     trainer.ckpt_interval=10 \
     trainer.max_prompt_length=$MAX_PROMPT_LENGTH \
     generator.sampling_params.max_generate_length=$MAX_RESPONSE_LENGTH \
@@ -119,6 +129,11 @@ _run_common() {
     ${USE_SIGMOID_VALUE_HEAD:+trainer.algorithm.value_head_type=sigmoid} \
     ${USE_SIGMOID_VALUE_HEAD:+trainer.algorithm.value_min=$VALUE_MIN} \
     ${USE_SIGMOID_VALUE_HEAD:+trainer.algorithm.value_max=$VALUE_MAX} \
+    ${USE_ZIP_VALUE_HEAD:+trainer.algorithm.value_head_type=zip} \
+    ${USE_ZIP_VALUE_HEAD:+trainer.algorithm.zip_distribution_token_id=$ZIP_DISTRIBUTION_TOKEN_ID} \
+    ${USE_ZIP_VALUE_HEAD:+"trainer.algorithm.zip_reward_values=$ZIP_REWARD_VALUES"} \
+    ${USE_ZIP_VALUE_HEAD:+trainer.algorithm.zip_num_length_bins=$ZIP_NUM_LENGTH_BINS} \
+    ${ZIP_CRITIC_PATH:+trainer.critic.model.path="$ZIP_CRITIC_PATH"} \
     "$@"
 }
 

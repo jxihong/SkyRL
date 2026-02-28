@@ -126,11 +126,16 @@ trainer:
     
     # value loss parameters
     value_clip: 0.2
-    # value_head_type: "regression" (MSE), "cross_entropy" (bin prediction), or "sigmoid" (binary BCE: value_min vs value_max)
+    # value_head_type: "regression" (MSE), "cross_entropy" (bin prediction), "sigmoid" (binary BCE), or "zip" (joint distribution)
     value_head_type: "regression"
     value_min: 0.0   # used for cross_entropy and sigmoid
     value_max: 1.0   # used for cross_entropy and sigmoid
     value_num_bins: 32  # only used when value_head_type: "cross_entropy"
+    # zip value head parameters (only used when value_head_type: "zip")
+    # Set trainer.critic.model.path to the pretrained zip critic checkpoint path
+    zip_distribution_token_id: 151669
+    zip_reward_values: [0.0, 1.0]
+    zip_num_length_bins: 8
     
     dynamic_sampling:
       type: null # filter, replace, or null
@@ -161,6 +166,7 @@ trainer:
       sort_context_by_reward: true  # if true, sort other trajectories by reward before showing to critic
       sort_order: "ascending"  # "ascending" (worst to best) or "descending" (best to worst)
       reward_precision: 4  # number of decimal places for reward formatting
+      max_num_context: -1  # max context examples per sample (-1 = all available)
   
   # Fully async specific knobs. For more see http://skyrl.readthedocs.io/en/latest/tutorials/fully_async.html#step-2-config-knobs-to-tune-for-fully-async-training
   fully_async:
@@ -194,6 +200,7 @@ trainer:
   policy_mini_batch_size: 256
   critic_mini_batch_size: 256
   micro_train_batch_size_per_gpu: 1
+  micro_critic_train_batch_size_per_gpu: null  # defaults to micro_train_batch_size_per_gpu; set lower for ICVL (longer critic sequences)
   micro_forward_batch_size_per_gpu: 1
   update_ref_every_epoch: false
   use_sample_packing: true

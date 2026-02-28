@@ -305,6 +305,9 @@ class FSDPCriticWorkerBase(CriticWorkerBase):
                 value_min=getattr(algo, "value_min", 0.0),
                 value_max=getattr(algo, "value_max", 1.0),
                 value_num_bins=getattr(algo, "value_num_bins", None) if value_head_type == "cross_entropy" else None,
+                zip_distribution_token_id=getattr(algo, "zip_distribution_token_id", None) if value_head_type == "zip" else None,
+                zip_reward_values=list(getattr(algo, "zip_reward_values", [0.0, 1.0])) if value_head_type == "zip" else None,
+                zip_num_length_bins=getattr(algo, "zip_num_length_bins", None) if value_head_type == "zip" else None,
             )
             self._seq_parallel_monkey_patch(model=critic, use_parent_class=True)
 

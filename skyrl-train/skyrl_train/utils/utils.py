@@ -124,12 +124,16 @@ def validate_batch_sizes(cfg: DictConfig):
             f"n_samples_per_prompt={cfg.generator.n_samples_per_prompt}, "
             f"dp_size={critic_dp_size}"
         )
+        critic_micro_bs = (
+            cfg.trainer.micro_critic_train_batch_size_per_gpu
+            or cfg.trainer.micro_train_batch_size_per_gpu
+        )
         assert (
-            critic_mini_batch_size_per_gpu % cfg.trainer.micro_train_batch_size_per_gpu == 0
-        ), f"normalized critic_mini_batch_size_per_gpu {critic_mini_batch_size_per_gpu} should be divisible by micro_train_batch_size_per_gpu {cfg.trainer.micro_train_batch_size_per_gpu}"
+            critic_mini_batch_size_per_gpu % critic_micro_bs == 0
+        ), f"normalized critic_mini_batch_size_per_gpu {critic_mini_batch_size_per_gpu} should be divisible by micro_critic_train_batch_size_per_gpu {critic_micro_bs}"
         assert (
-            critic_mini_batch_size_per_gpu // cfg.trainer.micro_train_batch_size_per_gpu > 0
-        ), f"normalized critic_mini_batch_size_per_gpu {critic_mini_batch_size_per_gpu} should be larger than micro_train_batch_size_per_gpu {cfg.trainer.micro_train_batch_size_per_gpu}"
+            critic_mini_batch_size_per_gpu // critic_micro_bs > 0
+        ), f"normalized critic_mini_batch_size_per_gpu {critic_mini_batch_size_per_gpu} should be larger than micro_critic_train_batch_size_per_gpu {critic_micro_bs}"
         critic_train_batch_size_per_gpu = (
             cfg.trainer.train_batch_size * cfg.generator.n_samples_per_prompt // critic_dp_size
         )

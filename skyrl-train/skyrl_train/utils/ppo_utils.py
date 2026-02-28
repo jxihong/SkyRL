@@ -218,6 +218,20 @@ def ppo_critic_loss(
         loss = masked_mean(loss, loss_mask, dim=-1).mean()
         return loss, None  # no clipfrac for sigmoid
 
+    if value_head_type == "zip" and value_logits is not None:
+        # value_logits: (B, T, num_reward_states) — marginalized reward logits
+        zip_reward_values = list(getattr(config, "zip_reward_values", [0.0, 1.0]))
+        num_reward_states = len(zip_reward_values)
+        rv = torch.tensor(zip_reward_values, device=returns.device, dtype=returns.dtype)
+        bin_idx = (returns.unsqueeze(-1) - rv).abs().argmin(dim=-1)
+        loss = torch.nn.functional.cross_entropy(
+            value_logits.reshape(-1, num_reward_states),
+            bin_idx.reshape(-1),
+            reduction="none",
+        ).reshape(returns.shape)
+        loss = masked_mean(loss, loss_mask, dim=-1).mean()
+        return loss, None
+
     if config.value_clip is not None:
         values_clipped = old_values + (values - old_values).clamp(-config.value_clip, config.value_clip)
         surr1 = (values_clipped - returns) ** 2

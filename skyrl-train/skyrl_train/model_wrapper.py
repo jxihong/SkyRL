@@ -411,6 +411,57 @@ def reset_position_ids(attention_mask):
     return position_ids
 
 
+def _load_lm_head_from_checkpoint(model_path: str, distribution_token_id: int, num_bins: int) -> torch.Tensor:
+    """Load lm_head weight rows for distribution tokens from a pretrained causal LM checkpoint.
+
+    When ``tie_word_embeddings`` is true the checkpoint has no ``lm_head.weight``;
+    the embedding tensor (``model.embed_tokens.weight``) is used instead.
+    """
+    import json
+    import os
+
+    _LM_HEAD = "lm_head.weight"
+    _EMBED = "model.embed_tokens.weight"
+
+    def _extract(f):
+        """Return the distribution-token rows from an open safetensors file."""
+        try:
+            w = f.get_tensor(_LM_HEAD)
+        except Exception:
+            w = f.get_tensor(_EMBED)
+        return w[distribution_token_id:distribution_token_id + num_bins].clone()
+
+    single_safetensors = os.path.join(model_path, "model.safetensors")
+    if os.path.exists(single_safetensors):
+        from safetensors import safe_open
+        with safe_open(single_safetensors, framework="pt", device="cpu") as f:
+            return _extract(f)
+
+    index_path = os.path.join(model_path, "model.safetensors.index.json")
+    if os.path.exists(index_path):
+        with open(index_path) as f:
+            index = json.load(f)
+        tensor_key = _LM_HEAD if _LM_HEAD in index["weight_map"] else _EMBED
+        shard_file = index["weight_map"].get(tensor_key)
+        if shard_file:
+            shard_path = os.path.join(model_path, shard_file)
+            from safetensors import safe_open
+            with safe_open(shard_path, framework="pt", device="cpu") as f:
+                return _extract(f)
+
+    pt_path = os.path.join(model_path, "pytorch_model.bin")
+    if os.path.exists(pt_path):
+        state_dict = torch.load(pt_path, map_location="cpu", weights_only=True)
+        w = state_dict.get(_LM_HEAD, state_dict.get(_EMBED))
+        result = w[distribution_token_id:distribution_token_id + num_bins].clone()
+        del state_dict
+        return result
+
+    raise FileNotFoundError(
+        f"Cannot find model weights (model.safetensors, sharded safetensors, or pytorch_model.bin) in {model_path}"
+    )
+
+
 def _get_critic_model(
     base_pretrained_model,
     base_llm_model,
@@ -429,6 +480,7 @@ def _get_critic_model(
             self.value_head_type = getattr(config, "value_head_type", "regression")
             self._use_value_bins = self.value_head_type == "cross_entropy"
             self._use_value_sigmoid = self.value_head_type == "sigmoid"
+            self._use_value_zip = self.value_head_type == "zip"
             if self._use_value_bins:
                 value_num_bins = getattr(config, "value_num_bins", 32)
                 value_min = getattr(config, "value_min", 0.0)
@@ -438,13 +490,27 @@ def _get_critic_model(
                     value_head_prefix,
                     nn.Linear(config.hidden_size, value_num_bins, bias=False),
                 )
-                # Midpoint of each bin: bin i has midpoint value_min + (i + 0.5) * (value_max - value_min) / value_num_bins
                 step = (value_max - value_min) / value_num_bins
                 bin_midpoints = torch.tensor(
                     [value_min + (i + 0.5) * step for i in range(value_num_bins)],
                     dtype=torch.float32,
                 )
                 self.register_buffer("value_bin_midpoints", bin_midpoints)
+            elif self._use_value_zip:
+                zip_reward_values = list(getattr(config, "zip_reward_values", [0.0, 1.0]))
+                zip_num_length_bins = getattr(config, "zip_num_length_bins", 8)
+                zip_num_bins = len(zip_reward_values) * zip_num_length_bins
+                setattr(
+                    self,
+                    value_head_prefix,
+                    nn.Linear(config.hidden_size, zip_num_bins, bias=False),
+                )
+                self.register_buffer(
+                    "zip_reward_values_buf",
+                    torch.tensor(zip_reward_values, dtype=torch.float32),
+                )
+                self.zip_num_length_bins = zip_num_length_bins
+                self.zip_num_reward_states = len(zip_reward_values)
             else:
                 setattr(self, value_head_prefix, nn.Linear(config.hidden_size, 1, bias=False))
 
@@ -527,6 +593,17 @@ def _get_critic_model(
                 value_max = getattr(self.config, "value_max", 1.0)
                 prob = torch.sigmoid(logits_or_values_BSH.float()).to(logits_or_values_BSH.dtype)
                 values_BSH = (value_min + prob * (value_max - value_min))
+            elif self._use_value_zip:
+                # logits_or_values_BSH: (B, S, zip_num_bins) — joint P(reward, length) logits
+                # Marginalize over length to get reward logits, then compute E[reward]
+                joint_logits = logits_or_values_BSH.float()
+                leading = joint_logits.shape[:-1]
+                joint_logits = joint_logits.view(*leading, self.zip_num_reward_states, self.zip_num_length_bins)
+                reward_logits = torch.logsumexp(joint_logits, dim=-1)  # (B, S, num_reward_states)
+                reward_probs = torch.softmax(reward_logits, dim=-1).to(logits_or_values_BSH.dtype)
+                rv = self.zip_reward_values_buf.to(device=reward_probs.device, dtype=reward_probs.dtype)
+                values_BSH = (reward_probs @ rv).unsqueeze(-1)  # (B, S, 1)
+                logits_or_values_BSH = reward_logits
             else:
                 values_BSH = logits_or_values_BSH
 
@@ -535,7 +612,7 @@ def _get_critic_model(
                 batch_size, seqlen = attention_mask.shape
                 # (1, nnz, 1) -> (nnz, 1) -> (batch_size, seqlen, 1)
                 values_BSH = pad_input(values_BSH.squeeze(0), indices=nnz_indices, batch=batch_size, seqlen=seqlen)
-                if self._use_value_bins or self._use_value_sigmoid:
+                if self._use_value_bins or self._use_value_sigmoid or self._use_value_zip:
                     logits_or_values_BSH = pad_input(
                         logits_or_values_BSH.squeeze(0), indices=nnz_indices, batch=batch_size, seqlen=seqlen
                     )
@@ -549,8 +626,7 @@ def _get_critic_model(
             action_values = values[:, -num_actions:]
 
             if return_output:
-                if self._use_value_bins or self._use_value_sigmoid:
-                    # value_logits for action positions (same as action_values: last n_act of values = seq indices -n_act-1:-1)
+                if self._use_value_bins or self._use_value_sigmoid or self._use_value_zip:
                     n_act = num_actions if isinstance(num_actions, int) else int(num_actions.max())
                     outputs["value_logits"] = logits_or_values_BSH[:, -n_act - 1 : -1, :]
                 return (action_values, outputs)
@@ -584,6 +660,9 @@ def get_llm_for_sequence_regression(
     value_min: float = 0.0,
     value_max: float = 1.0,
     value_num_bins: Optional[int] = None,
+    zip_distribution_token_id: Optional[int] = None,
+    zip_reward_values: Optional[list] = None,
+    zip_num_length_bins: Optional[int] = None,
     **kwargs,
 ) -> nn.Module:
     """Get transformer with a sequence classification head on top (linear layer).
@@ -612,6 +691,14 @@ def get_llm_for_sequence_regression(
         config.value_head_type = "sigmoid"
         config.value_min = value_min
         config.value_max = value_max
+    elif value_head_type == "zip":
+        _zip_rv = list(zip_reward_values or [0.0, 1.0])
+        _zip_nlb = zip_num_length_bins or 8
+        config.value_head_type = "zip"
+        config.zip_distribution_token_id = zip_distribution_token_id or 151669
+        config.zip_reward_values = _zip_rv
+        config.zip_num_length_bins = _zip_nlb
+        config.zip_num_bins = len(_zip_rv) * _zip_nlb
 
     base_class = AutoModel._model_mapping[type(config)]
     base_pretrained_class = base_class.__base__
@@ -682,6 +769,19 @@ def get_llm_for_sequence_regression(
 
     # https://github.com/huggingface/transformers/issues/26877
     model.config.use_cache = False
+
+    if value_head_type == "zip":
+        _zip_dtid = getattr(config, "zip_distribution_token_id", 151669)
+        _zip_nbins = getattr(config, "zip_num_bins", 16)
+        lm_head_rows = _load_lm_head_from_checkpoint(model_name_or_path, _zip_dtid, _zip_nbins)
+        value_head = getattr(model, value_head_prefix)
+        target_dtype = torch.bfloat16 if bf16 else torch.float32
+        value_head.weight.data.copy_(lm_head_rows.to(dtype=target_dtype, device=value_head.weight.device))
+        logger.info(
+            f"[zip] Loaded lm_head rows [{_zip_dtid}:{_zip_dtid + _zip_nbins}] "
+            f"into {value_head_prefix} from {model_name_or_path}"
+        )
+        del lm_head_rows
 
     # NOTE: For reward model training only, intialize value_head manually
     # because deepspeed.zero.Init() will not intialize them.

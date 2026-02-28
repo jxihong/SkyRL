@@ -982,16 +982,18 @@ class CriticWorkerBase(Worker):
         )
 
     def ppo_train(self, train_data: TrainingInputBatch) -> TrainingOutputBatch:
+        micro_bs = (
+            self.cfg.trainer.micro_critic_train_batch_size_per_gpu
+            or self.cfg.trainer.micro_train_batch_size_per_gpu
+        )
         dataloader = BatchIterator(
-            train_data, sample_batch_size=self.cfg.trainer.micro_train_batch_size_per_gpu, drop_last=False
+            train_data, sample_batch_size=micro_bs, drop_last=False
         )
 
         torch.cuda.empty_cache()
         self.model.train()
 
-        micro_batches_per_mini_batch = (
-            self.critic_mini_batch_size_per_gpu // self.cfg.trainer.micro_train_batch_size_per_gpu
-        )
+        micro_batches_per_mini_batch = self.critic_mini_batch_size_per_gpu // micro_bs
         # The number of steps (over micro batches) to accumulate gradients before taking an optimizer step.
         accumulation_steps = micro_batches_per_mini_batch
 
