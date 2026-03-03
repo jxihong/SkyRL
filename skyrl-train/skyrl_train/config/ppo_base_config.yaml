@@ -149,6 +149,8 @@ trainer:
     
     # teacher-distillation parameters
     teacher_distillation:
+      # Max sequences per teacher forward call (teacher ICL sequences are long; chunk to avoid OOM). null = no chunking.
+      teacher_forward_batch_size: null
       # Teacher training loss type (currently only "dro" is supported)
       teacher_loss_type: "dro"
       # DRO regularization coefficient (higher = teacher stays closer to student distribution)
@@ -200,9 +202,8 @@ trainer:
   critic_mini_batch_size: 256
   micro_train_batch_size_per_gpu: 1
   micro_forward_batch_size_per_gpu: 1
-  # Teacher-distillation: optional smaller micro batch for teacher training backward (set to 1–2 to avoid OOM)
+  # Teacher-distillation: teacher forward OOM is handled by algorithm.teacher_distillation.teacher_forward_batch_size (trainer-level chunking). The keys below are reserved; workers do not currently use them.
   teacher_micro_train_batch_size_per_gpu: null
-  # Teacher-distillation: optional smaller micro batch for teacher forward (ICL sequences are long; set to 1–4 to avoid OOM)
   teacher_micro_forward_batch_size_per_gpu: null
   update_ref_every_epoch: false
   use_sample_packing: true

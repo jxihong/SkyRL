@@ -23,7 +23,7 @@ set -x
 : "${TRAIN_BATCH_SIZE:=1024}"
 : "${POLICY_MINI_BATCH_SIZE:=512}"
 : "${CRITIC_MINI_BATCH_SIZE:=512}"
-: "${N_SAMPLES_PER_PROMPT:=4}"
+: "${N_SAMPLES_PER_PROMPT:=2}"
 : "${MAX_PROMPT_LENGTH:=1024}"
 : "${MAX_RESPONSE_LENGTH:=8196}"
 : "${POLICY_LR:=1e-6}"
@@ -58,10 +58,8 @@ fi
 # With STUDENT_GAE_LAMBDA=0, this is exactly immediate on-policy distillation.
 : "${STUDENT_GAE_LAMBDA:=0.0}"
 : "${STUDENT_GAE_GAMMA:=1.0}"
-# teacher_micro_forward_batch_size_per_gpu: teacher forward on long ICL sequences; use smaller micro batch to avoid OOM
-: "${TEACHER_MICRO_FORWARD_BATCH_SIZE_PER_GPU:=2}"
-# teacher_micro_train_batch_size_per_gpu: teacher training backward on long ICL sequences
-: "${TEACHER_MICRO_TRAIN_BATCH_SIZE_PER_GPU:=2}"
+# Teacher forward sees much longer context than student; keep this small to avoid OOM.
+: "${TEACHER_FORWARD_BATCH_SIZE:=$NUM_GPUS}"
 
 uv run --isolated --extra $INFERENCE_BACKEND -m examples.teacher_distillation.main_teacher_distillation \
   data.train_data="['$DATA_DIR/train.parquet']" \
@@ -71,6 +69,7 @@ uv run --isolated --extra $INFERENCE_BACKEND -m examples.teacher_distillation.ma
   trainer.algorithm.teacher_distillation.teacher_loss_alpha=$TEACHER_LOSS_ALPHA \
   trainer.algorithm.teacher_distillation.student_gae_lambda=$STUDENT_GAE_LAMBDA \
   trainer.algorithm.teacher_distillation.student_gae_gamma=$STUDENT_GAE_GAMMA \
+  trainer.algorithm.teacher_distillation.teacher_forward_batch_size=$TEACHER_FORWARD_BATCH_SIZE \
   trainer.algorithm.teacher_distillation.reward_format="$TD_REWARD_FORMAT" \
   trainer.algorithm.teacher_distillation.sort_context_by_reward=$TD_SORT_CONTEXT \
   trainer.algorithm.teacher_distillation.sort_order="$TD_SORT_ORDER" \
@@ -91,8 +90,6 @@ uv run --isolated --extra $INFERENCE_BACKEND -m examples.teacher_distillation.ma
   trainer.critic_mini_batch_size=$CRITIC_MINI_BATCH_SIZE \
   trainer.micro_forward_batch_size_per_gpu=8 \
   trainer.micro_train_batch_size_per_gpu=8 \
-  trainer.teacher_micro_forward_batch_size_per_gpu=$TEACHER_MICRO_FORWARD_BATCH_SIZE_PER_GPU \
-  trainer.teacher_micro_train_batch_size_per_gpu=$TEACHER_MICRO_TRAIN_BATCH_SIZE_PER_GPU \
   trainer.ckpt_interval=10 \
   trainer.max_prompt_length=$MAX_PROMPT_LENGTH \
   generator.sampling_params.max_generate_length=$MAX_RESPONSE_LENGTH \
