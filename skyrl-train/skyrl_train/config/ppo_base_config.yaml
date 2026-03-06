@@ -136,6 +136,8 @@ trainer:
     zip_distribution_token_id: 151669
     zip_reward_values: [0.0, 1.0]
     zip_num_length_bins: 8
+    # If true, treat ZIP head labels as [0,1] and bridge to PPO's [-1,1] value/return space.
+    zip_scale_zero_one_rewards: false
     
     dynamic_sampling:
       type: null # filter, replace, or null
@@ -217,6 +219,13 @@ trainer:
   run_name: "test_run"
   run_group: null  # optional; when set, wandb runs are grouped under this name for comparison
   logger: "wandb"
+  rollout_visualization:
+    enabled: false
+    rollout_viz_before_train: false
+    log_interval: 10
+    max_samples_per_log: 4
+    max_tokens_per_sample: 256
+    normalize_per_sample: true
   dump_data_batch: false
   dump_eval_results: true
 

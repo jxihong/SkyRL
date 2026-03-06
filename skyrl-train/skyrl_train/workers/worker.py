@@ -885,6 +885,21 @@ class CriticWorkerBase(Worker):
         self.mesh_rank: MeshRank = None
         self.critic_loss_fn: Callable = ppo_critic_loss
 
+    def forward(
+        self,
+        data: TrainingInputBatch,
+    ) -> TrainingOutputBatch:
+        """Run forward pass in inference mode, chunked by critic micro batch size."""
+        micro_bs = self.cfg.trainer.micro_critic_train_batch_size_per_gpu
+        micro_batches = data.chunk(micro_bs)
+        outputs = []
+        for micro_batch in micro_batches:
+            outputs.append(self._forward_micro_batch(micro_batch))
+        output = TrainingOutputBatch.cat(outputs)
+        if output.device is not None and output.device != torch.device("cpu"):
+            output = output.to("cpu")
+        return output
+
     def _normalize_mini_batch_size(self):
         """
         Normalize batch sizes based on device mesh and generation parameters.
@@ -982,10 +997,7 @@ class CriticWorkerBase(Worker):
         )
 
     def ppo_train(self, train_data: TrainingInputBatch) -> TrainingOutputBatch:
-        micro_bs = (
-            self.cfg.trainer.micro_critic_train_batch_size_per_gpu
-            or self.cfg.trainer.micro_train_batch_size_per_gpu
-        )
+        micro_bs = self.cfg.trainer.micro_critic_train_batch_size_per_gpu
         dataloader = BatchIterator(
             train_data, sample_batch_size=micro_bs, drop_last=False
         )

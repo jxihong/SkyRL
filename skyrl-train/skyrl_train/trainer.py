@@ -60,6 +60,7 @@ from skyrl_train.utils.trainer_utils import (
 from skyrl_train.utils.utils import configure_ray_worker_logging
 from skyrl_train.evaluate import evaluate, evaluate_step_wise
 from skyrl_train.utils.logging_utils import log_example
+from skyrl_train.utils.rollout_viz import build_rollout_value_advantage_wandb_payload
 
 
 class RayPPOTrainer:
@@ -108,6 +109,53 @@ class RayPPOTrainer:
 
         self.reward_kl_controller: Optional[Union[FixedKLController, AdaptiveKLController]] = None
         configure_ray_worker_logging()
+
+    def _maybe_log_rollout_value_visualizations(
+        self,
+        training_input: TrainingInputBatch,
+        response_ids: List[List[int]],
+        prompts: Optional[List[Any]] = None,
+    ) -> None:
+        viz_cfg = getattr(self.cfg.trainer, "rollout_visualization", None)
+        if viz_cfg is None or not bool(viz_cfg.enabled):
+            return
+        if "wandb" not in self.tracker.logger:
+            return
+        log_interval = int(viz_cfg.log_interval)
+        log_first_iter = bool(getattr(viz_cfg, "rollout_viz_before_train", False)) and self.global_step == 1
+        if (log_interval <= 0 or self.global_step % log_interval != 0) and not log_first_iter:
+            return
+
+        payload = build_rollout_value_advantage_wandb_payload(
+            wandb_module=self.tracker.logger["wandb"],
+            tokenizer=self.tokenizer,
+            response_ids=response_ids,
+            values=training_input["values"],
+            advantages=training_input["advantages"],
+            response_mask=training_input["response_mask"],
+            rewards=training_input.get("rewards"),
+            global_step=self.global_step,
+            max_samples_per_log=int(viz_cfg.max_samples_per_log),
+            max_tokens_per_sample=int(viz_cfg.max_tokens_per_sample),
+            normalize_per_sample=bool(viz_cfg.normalize_per_sample),
+            is_last_step=training_input.get("is_last_step"),
+            uids=training_input.metadata.get("uids") if training_input.metadata is not None else None,
+            prompts=prompts,
+        )
+        if payload:
+            self.tracker.log(payload, step=self.global_step, commit=False)
+
+    def _decode_prompt_token_ids(self, prompt_token_ids: Optional[List[List[int]]]) -> Optional[List[str]]:
+        if prompt_token_ids is None:
+            return None
+        return [
+            self.tokenizer.decode(
+                token_ids,
+                skip_special_tokens=False,
+                clean_up_tokenization_spaces=False,
+            )
+            for token_ids in prompt_token_ids
+        ]
 
     def _build_train_dataloader_and_compute_training_steps(self):
         """
@@ -191,6 +239,7 @@ class RayPPOTrainer:
         self.global_step += 1  # start training at global_step 1
         for epoch in range(start_epoch, self.cfg.trainer.epochs):
             for iter, rand_prompts in enumerate(self.train_dataloader):
+                keep_sampling = False
                 with Timer("step", self.all_timings):
                     # for colocate_all=true, inference engine is always on GPU when starting the training step
 
@@ -217,93 +266,114 @@ class RayPPOTrainer:
                     # dynamic sampling
                     if self.cfg.trainer.algorithm.dynamic_sampling.type is not None:
                         generator_output, uids, keep_sampling = self.handle_dynamic_sampling(generator_output, uids)
-                        if keep_sampling:  # continue sampling
-                            # update progress bar for current batch (but not global step)
-                            pbar.update(1)
-                            continue
 
-                    if self.colocate_all:
-                        # if we are not continuing sampling, we sleep the inference engine
-                        asyncio.run(self.inference_engine_client.sleep())
+                    if not keep_sampling:
+                        if self.colocate_all:
+                            # if we are not continuing sampling, we sleep the inference engine
+                            asyncio.run(self.inference_engine_client.sleep())
 
-                    # 1.2 postprocess rewards
-                    with Timer("postprocess_generator_output", self.all_timings):
-                        generator_output = self.postprocess_generator_output(generator_output, uids)
+                        # 1.2 postprocess rewards
+                        with Timer("postprocess_generator_output", self.all_timings):
+                            generator_output = self.postprocess_generator_output(generator_output, uids)
 
-                    # 2. print example just for debugging
-                    vis = self.tokenizer.decode(generator_output["response_ids"][0])
-                    log_example(
-                        logger,
-                        prompt=generator_input["prompts"][0],
-                        response=vis,
-                        reward=generator_output["rewards"][0],
-                    )
+                        prompts_for_logging = self._decode_prompt_token_ids(generator_output.get("prompt_token_ids"))
+                        if prompts_for_logging is not None and (
+                            len(prompts_for_logging) != len(generator_output["response_ids"])
+                        ):
+                            logger.warning(
+                                "Skipping rollout prompt text for logging because prompt/response lengths are mismatched: "
+                                f"{len(prompts_for_logging)} prompts vs {len(generator_output['response_ids'])} responses."
+                            )
+                            prompts_for_logging = None
 
-                    with Timer("convert_to_training_input", self.all_timings):
-                        training_input: TrainingInputBatch = self.convert_to_training_input(generator_output, uids)
-                        logger.info(f"Number of sequences: {len(training_input['sequences'])}")
+                        # 2. print example just for debugging
+                        prompt_for_example = (
+                            prompts_for_logging[0] if prompts_for_logging is not None and len(prompts_for_logging) > 0 else ""
+                        )
+                        vis = self.tokenizer.decode(generator_output["response_ids"][0])
+                        log_example(
+                            logger,
+                            prompt=prompt_for_example,
+                            response=vis,
+                            reward=generator_output["rewards"][0],
+                        )
 
-                    # 1.4 inference and calculate values, log probs, rewards, kl divergence
-                    with Timer("fwd_logprobs_values_reward", self.all_timings):
-                        training_input = self.fwd_logprobs_values_reward(training_input)
+                        with Timer("convert_to_training_input", self.all_timings):
+                            training_input: TrainingInputBatch = self.convert_to_training_input(generator_output, uids)
+                            logger.info(f"Number of sequences: {len(training_input['sequences'])}")
 
-                    # 1.5 apply kl divergence penalty to rewards
-                    if self.cfg.trainer.algorithm.use_kl_in_reward:
-                        with Timer("apply_reward_kl_penalty", self.all_timings):
-                            training_input = self.apply_reward_kl_penalty(training_input)
+                        # 1.4 inference and calculate values, log probs, rewards, kl divergence
+                        with Timer("fwd_logprobs_values_reward", self.all_timings):
+                            training_input = self.fwd_logprobs_values_reward(training_input)
 
-                    # 3. calculate advantages and returns
-                    with Timer("compute_advantages_and_returns", self.all_timings):
-                        training_input = self.compute_advantages_and_returns(training_input)
-                        # remove some unwanted keys
-                        for key in ["rewards"]:
-                            training_input.pop(key)
-                        training_input.metadata.pop("uids")
+                        # 1.5 apply kl divergence penalty to rewards
+                        if self.cfg.trainer.algorithm.use_kl_in_reward:
+                            with Timer("apply_reward_kl_penalty", self.all_timings):
+                                training_input = self.apply_reward_kl_penalty(training_input)
 
-                        if self.cfg.trainer.algorithm.advantage_batch_normalize:
-                            training_input = normalize_advantages_dict(training_input)
+                        # 3. calculate advantages and returns
+                        with Timer("compute_advantages_and_returns", self.all_timings):
+                            training_input = self.compute_advantages_and_returns(training_input)
 
-                    if self.cfg.trainer.dump_data_batch:
-                        # dump data to file
-                        with Timer("dump_data_batch"):
-                            self.dump_data(training_input, file_name=f"global_step_{self.global_step}_training_input")
+                            if self.cfg.trainer.algorithm.advantage_batch_normalize:
+                                training_input = normalize_advantages_dict(training_input)
 
-                    # 4. train policy/critic model
-                    # Policy model is backloaded to GPU during training
-                    with Timer("train_critic_and_policy", self.all_timings):
-                        status = self.train_critic_and_policy(training_input)
+                            self._maybe_log_rollout_value_visualizations(
+                                training_input=training_input,
+                                response_ids=generator_output["response_ids"],
+                                prompts=prompts_for_logging,
+                            )
+                            # remove some unwanted keys
+                            for key in ["rewards"]:
+                                training_input.pop(key)
+                            training_input.metadata.pop("uids")
 
-                    # 5. conditionally save checkpoints and hf model
-                    if self.cfg.trainer.ckpt_interval > 0 and self.global_step % self.cfg.trainer.ckpt_interval == 0:
-                        with Timer("save_checkpoints", self.all_timings):
-                            self.save_checkpoints()
-                    if (
-                        self.cfg.trainer.hf_save_interval > 0
-                        and self.global_step % self.cfg.trainer.hf_save_interval == 0
-                    ):
-                        with Timer("save_hf_model", self.all_timings):
-                            self.save_models()
+                        if self.cfg.trainer.dump_data_batch:
+                            # dump data to file
+                            with Timer("dump_data_batch"):
+                                self.dump_data(training_input, file_name=f"global_step_{self.global_step}_training_input")
 
-                    # 6. conditionally sync policy and ref at the end of the epoch
-                    if (
-                        self.cfg.trainer.update_ref_every_epoch
-                        and self.ref_model is not None
-                        and iter == len(self.train_dataloader) - 1
-                        and epoch != self.cfg.trainer.epochs - 1  # skip updating ref at the end of the last epoch
-                    ):
-                        with Timer("update_ref_with_policy", self.all_timings):
-                            self.update_ref_with_policy()
+                        # 4. train policy/critic model
+                        # Policy model is backloaded to GPU during training
+                        with Timer("train_critic_and_policy", self.all_timings):
+                            status = self.train_critic_and_policy(training_input)
 
-                    # 7. sync weights to inference engines
-                    if self.colocate_all:
-                        self.policy_model.offload_to_cpu(offload_optimizer=True, offload_model=False)
-                        asyncio.run(self.inference_engine_client.wake_up(tags=["weights"]))
-                    with Timer("sync_weights", self.all_timings):
-                        ray.get(self.sync_policy_weights_to_inference_engines())
-                    if self.colocate_all:
-                        with Timer("offload_policy_model_to_cpu"):
-                            self.policy_model.offload_to_cpu(offload_optimizer=False, offload_model=True)
-                        asyncio.run(self.inference_engine_client.wake_up(tags=["kv_cache"]))
+                        # 5. conditionally save checkpoints and hf model
+                        if self.cfg.trainer.ckpt_interval > 0 and self.global_step % self.cfg.trainer.ckpt_interval == 0:
+                            with Timer("save_checkpoints", self.all_timings):
+                                self.save_checkpoints()
+                        if (
+                            self.cfg.trainer.hf_save_interval > 0
+                            and self.global_step % self.cfg.trainer.hf_save_interval == 0
+                        ):
+                            with Timer("save_hf_model", self.all_timings):
+                                self.save_models()
+
+                        # 6. conditionally sync policy and ref at the end of the epoch
+                        if (
+                            self.cfg.trainer.update_ref_every_epoch
+                            and self.ref_model is not None
+                            and iter == len(self.train_dataloader) - 1
+                            and epoch != self.cfg.trainer.epochs - 1  # skip updating ref at the end of the last epoch
+                        ):
+                            with Timer("update_ref_with_policy", self.all_timings):
+                                self.update_ref_with_policy()
+
+                        # 7. sync weights to inference engines
+                        if self.colocate_all:
+                            self.policy_model.offload_to_cpu(offload_optimizer=True, offload_model=False)
+                            asyncio.run(self.inference_engine_client.wake_up(tags=["weights"]))
+                        with Timer("sync_weights", self.all_timings):
+                            ray.get(self.sync_policy_weights_to_inference_engines())
+                        if self.colocate_all:
+                            with Timer("offload_policy_model_to_cpu"):
+                                self.policy_model.offload_to_cpu(offload_optimizer=False, offload_model=True)
+                            asyncio.run(self.inference_engine_client.wake_up(tags=["kv_cache"]))
+
+                if keep_sampling:
+                    # update progress bar for current batch (but not global step)
+                    pbar.update(1)
+                    continue
 
                 # 8. set logs
                 logger.info(status)
@@ -908,6 +978,7 @@ class RayPPOTrainer:
             training_input["icvl_critic_sequences"] = formatted_sequences
             training_input["icvl_critic_attention_mask"] = formatted_attention_masks
 
+        # Critic always sees ICVL context when advantage_estimator == "icvl" (critic_fwd_pass above).
         # calculate critic values (ICVL: uses context-formatted batch; else: same as ref/policy)
         if self.colocate_all and self.critic_model is not None:
             self.critic_model.backload_to_gpu(backload_optimizer=False, backload_model=True)
@@ -981,6 +1052,13 @@ class RayPPOTrainer:
         base_log_probs = base_log_probs[: len(sequences_all)] if base_log_probs is not None else None
         action_log_probs = action_log_probs[: len(sequences_all)]
         values = values[: len(sequences_all)] if values is not None else None
+        if (
+            values is not None
+            and getattr(self.cfg.trainer.algorithm, "value_head_type", "regression") == "zip"
+            and bool(getattr(self.cfg.trainer.algorithm, "zip_scale_zero_one_rewards", False))
+        ):
+            # Keep ZIP logits/targets in [0,1], but adapt critic values to PPO's [-1,1] space.
+            values = values * 2.0 - 1.0
 
         training_input["base_action_log_probs"] = base_log_probs
         training_input["action_log_probs"] = action_log_probs
@@ -1075,7 +1153,14 @@ class RayPPOTrainer:
         data.metadata["global_step"] = self.global_step
 
         # Build separate critic batch with ICVL-formatted sequences when available.
-        # Pop the cached tensors from `data` so the policy never sees them.
+        # When ICVL is enabled, the critic must always see context-formatted input (inference and training).
+        use_icvl = self.cfg.trainer.algorithm.advantage_estimator == "icvl"
+        if self.critic_model is not None and use_icvl:
+            if "icvl_critic_sequences" not in data:
+                raise RuntimeError(
+                    "ICVL is enabled but critic training data has no context-formatted sequences "
+                    "(missing icvl_critic_sequences). The critic must receive ICVL context every time it is called."
+                )
         critic_data = data
         if "icvl_critic_sequences" in data:
             icvl_seqs = data.pop("icvl_critic_sequences")

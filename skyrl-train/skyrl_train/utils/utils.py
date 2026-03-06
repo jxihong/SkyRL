@@ -64,6 +64,11 @@ def validate_batch_sizes(cfg: DictConfig):
         assert cfg.trainer.critic_mini_batch_size > 0, "critic_mini_batch_size must be greater than 0"
     assert cfg.trainer.micro_train_batch_size_per_gpu > 0, "micro_train_batch_size_per_gpu must be greater than 0"
     assert cfg.trainer.micro_forward_batch_size_per_gpu > 0, "micro_forward_batch_size_per_gpu must be greater than 0"
+    if cfg.trainer.micro_critic_train_batch_size_per_gpu is None:
+        cfg.trainer.micro_critic_train_batch_size_per_gpu = cfg.trainer.micro_train_batch_size_per_gpu
+    assert (
+        cfg.trainer.micro_critic_train_batch_size_per_gpu > 0
+    ), "micro_critic_train_batch_size_per_gpu must be greater than 0"
 
     # Validate policy mini batch size
     policy_world_size = cfg.trainer.placement.policy_num_nodes * cfg.trainer.placement.policy_num_gpus_per_node
@@ -124,10 +129,7 @@ def validate_batch_sizes(cfg: DictConfig):
             f"n_samples_per_prompt={cfg.generator.n_samples_per_prompt}, "
             f"dp_size={critic_dp_size}"
         )
-        critic_micro_bs = (
-            cfg.trainer.micro_critic_train_batch_size_per_gpu
-            or cfg.trainer.micro_train_batch_size_per_gpu
-        )
+        critic_micro_bs = cfg.trainer.micro_critic_train_batch_size_per_gpu
         assert (
             critic_mini_batch_size_per_gpu % critic_micro_bs == 0
         ), f"normalized critic_mini_batch_size_per_gpu {critic_mini_batch_size_per_gpu} should be divisible by micro_critic_train_batch_size_per_gpu {critic_micro_bs}"
@@ -268,6 +270,14 @@ def validate_cfg(cfg: DictConfig):
     elif algorithm_config.use_kl_estimator_k3:
         logger.warning("`use_kl_estimator_k3` will be deprecated, overriding to use `kl_estimator_type='k3'` instead")
         algorithm_config.kl_estimator_type = "k3"
+    if bool(getattr(algorithm_config, "zip_scale_zero_one_rewards", False)):
+        assert algorithm_config.value_head_type == "zip", (
+            "zip_scale_zero_one_rewards requires value_head_type='zip'"
+        )
+        zip_reward_values = list(getattr(algorithm_config, "zip_reward_values", [0.0, 1.0]))
+        assert len(zip_reward_values) == 2 and abs(zip_reward_values[0]) < 1e-6 and abs(zip_reward_values[1] - 1.0) < 1e-6, (
+            "zip_scale_zero_one_rewards requires zip_reward_values=[0.0, 1.0]"
+        )
     cfg.trainer.algorithm = algorithm_config
 
     if cfg.trainer.strategy == "deepspeed" and not (
@@ -632,6 +642,9 @@ def initialize_ray(cfg: DictConfig):
     """
     Initialize Ray cluster with prepared runtime environment.
 
+    Uses a writable temp directory for Ray's session (default ~/.cache/ray) to avoid
+    PermissionError when /tmp/ray is not writable. Override with RAY_TMPDIR.
+
     Args:
         cfg: Training config
     """
@@ -640,7 +653,15 @@ def initialize_ray(cfg: DictConfig):
     )
 
     env_vars = prepare_runtime_environment(cfg)
-    ray.init(runtime_env={"env_vars": env_vars})
+    ray_temp_dir = os.environ.get("RAY_TMPDIR") or os.path.expanduser("~/.cache/ray")
+    try:
+        os.makedirs(ray_temp_dir, exist_ok=True)
+    except OSError:
+        ray_temp_dir = None
+    init_kwargs = {"runtime_env": {"env_vars": env_vars}}
+    if ray_temp_dir:
+        init_kwargs["_temp_dir"] = ray_temp_dir
+    ray.init(**init_kwargs)
 
     # create the named ray actors for the registries to make available to all workers
     sync_registries()

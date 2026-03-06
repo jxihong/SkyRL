@@ -6,6 +6,7 @@ __pycache__/
 /outputs/
 /skyrl-train/outputs/
 /data/lcb
+logs/
 
 # Documentation build artifacts
 /skyrl-train/docs/_build/

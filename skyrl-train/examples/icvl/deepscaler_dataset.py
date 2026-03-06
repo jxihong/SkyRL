@@ -5,7 +5,7 @@ Dataset: https://huggingface.co/datasets/agentica-org/DeepScaleR-Preview-Dataset
 The dataset contains ~40k math problems with answers from AIME, AMC, Omni-MATH, etc.
 
 Usage:
-    uv run examples/icvl_deepscaler/deepscaler_dataset.py --output_dir $HOME/data/deepscaler
+    uv run examples/icvl/deepscaler_dataset.py --output_dir $HOME/data/deepscaler
 """
 
 import argparse
@@ -84,6 +84,34 @@ def main():
 
     print(f"Saved train ({len(train_dataset)} examples) to: {train_path}")
     print(f"Saved val ({len(val_dataset)} examples) to: {val_path}")
+
+    # AIME 2025 as additional validation dataset (same schema as DeepScaleR)
+    aime_source = "math-ai/aime25"
+    print(f"Loading AIME 2025: {aime_source}")
+    aime_ds = datasets.load_dataset(aime_source, split="test")
+    print(f"AIME 2025: {len(aime_ds)} examples")
+
+    def process_aime(example, idx):
+        problem = example["problem"]
+        answer = example["answer"]
+        prompt_text = f"{problem}\n\n{INSTRUCTION}"
+        return {
+            "data_source": aime_source,
+            "prompt": [{"role": "user", "content": prompt_text}],
+            "env_class": "aime",
+            "reward_model": {"ground_truth": answer, "style": "rule"},
+            "extra_info": {
+                "split": "aime2025",
+                "index": idx,
+                "problem": problem,
+                "answer": answer,
+            },
+        }
+
+    aime_val = aime_ds.map(function=process_aime, with_indices=True)
+    aime_val_path = os.path.join(args.output_dir, "validation_aime2025.parquet")
+    aime_val.to_parquet(aime_val_path)
+    print(f"Saved AIME 2025 val ({len(aime_val)} examples) to: {aime_val_path}")
 
 
 if __name__ == "__main__":

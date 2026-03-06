@@ -223,7 +223,11 @@ def ppo_critic_loss(
         zip_reward_values = list(getattr(config, "zip_reward_values", [0.0, 1.0]))
         num_reward_states = len(zip_reward_values)
         rv = torch.tensor(zip_reward_values, device=returns.device, dtype=returns.dtype)
-        bin_idx = (returns.unsqueeze(-1) - rv).abs().argmin(dim=-1)
+        returns_for_zip = returns
+        if bool(getattr(config, "zip_scale_zero_one_rewards", False)):
+            # PPO may operate in [-1,1] while a pretrained ZIP critic is calibrated on [0,1].
+            returns_for_zip = (returns + 1.0) / 2.0
+        bin_idx = (returns_for_zip.unsqueeze(-1) - rv).abs().argmin(dim=-1)
         loss = torch.nn.functional.cross_entropy(
             value_logits.reshape(-1, num_reward_states),
             bin_idx.reshape(-1),

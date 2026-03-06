@@ -26,6 +26,11 @@ set -x
 : "${NUM_GPUS:=8}"
 : "${LOGGER:=wandb}"
 : "${INFERENCE_BACKEND:=vllm}"
+: "${ROLLOUT_VIZ:=true}"
+: "${ROLLOUT_VIZ_BEFORE_TRAIN:=true}"
+: "${ROLLOUT_VIZ_INTERVAL:=5}"
+: "${ROLLOUT_VIZ_SAMPLES:=4}"
+: "${ROLLOUT_VIZ_NORMALIZE_PER_SAMPLE:=false}"
 
 # --- Training hyperparameters ---
 : "${TRAIN_BATCH_SIZE:=1024}"
@@ -35,8 +40,14 @@ set -x
 : "${MAX_PROMPT_LENGTH:=1024}"
 : "${MAX_RESPONSE_LENGTH:=8192}"
 : "${LR:=1e-6}"
-: "${EPOCHS:=20}"
+: "${EPOCHS:=5}"
 : "${KL_LOSS_COEF:=0.001}"
+# GAE (Generalized Advantage Estimation): lambda in [0,1]; default 1.0 (no discount on advantages)
+: "${GAE_LAMBDA:=0.0}"
+# --- Dynamic sampling (DAPO-style filter) ---
+# filter: drop prompt-groups with std==0 rewards and resample to fill batch
+: "${DYNAMIC_SAMPLING_TYPE:=filter}"
+: "${DYNAMIC_SAMPLING_MAX_SAMPLE_BATCHES:=10}"
 
 # --- ICVL-specific parameters ---
 : "${ICVL_REWARD_FORMAT:=raw}"
@@ -60,10 +71,11 @@ set -x
 # USE_ZIP_VALUE_HEAD=true: critic uses ZIP to predict joint distribution of reward and length.
 # can load from pretrained critic using ZIP_CRITIC_PATH.
 : "${USE_ZIP_VALUE_HEAD:=true}"
-: "${ZIP_CRITIC_PATH:=}"
+: "${ZIP_CRITIC_PATH:=/home/rohin/icl_value/models/joint_distribution_critic_no_ans_supervise_from_8_with_32}"
 : "${ZIP_DISTRIBUTION_TOKEN_ID:=151669}"
-: "${ZIP_REWARD_VALUES:=[-1.0,1.0]}"
+: "${ZIP_REWARD_VALUES:=[0.0,1.0]}"
 : "${ZIP_NUM_LENGTH_BINS:=8}"
+: "${ZIP_SCALE_ZERO_ONE_REWARDS:=true}"
 
 # Set to "true" to enable thinking, "false" to disable. Empty = model default (usually true).
 : "${ENABLE_THINKING:=}"
@@ -81,7 +93,7 @@ fi
 _run_common() {
   uv run --isolated --extra $INFERENCE_BACKEND -m skyrl_train.entrypoints.main_base \
     data.train_data="['$DATA_DIR/train.parquet']" \
-    data.val_data="['$DATA_DIR/validation.parquet']" \
+    data.val_data="['$DATA_DIR/validation.parquet','$DATA_DIR/validation_aime2025.parquet']" \
     trainer.policy.model.path="$MODEL_NAME" \
     trainer.critic.model.path="$MODEL_NAME" \
     trainer.placement.colocate_all=true \
@@ -99,12 +111,16 @@ _run_common() {
     trainer.micro_forward_batch_size_per_gpu=8 \
     trainer.micro_train_batch_size_per_gpu=8 \
     trainer.micro_critic_train_batch_size_per_gpu=$MICRO_CRITIC_TRAIN_BS \
-    trainer.ckpt_interval=10 \
+    trainer.ckpt_interval=5 \
+    trainer.hf_save_interval=5 \
     trainer.max_prompt_length=$MAX_PROMPT_LENGTH \
     generator.sampling_params.max_generate_length=$MAX_RESPONSE_LENGTH \
     trainer.policy.optimizer_config.lr=$LR \
     trainer.algorithm.use_kl_loss=true \
     trainer.algorithm.kl_loss_coef=$KL_LOSS_COEF \
+    trainer.algorithm.lambd=$GAE_LAMBDA \
+    trainer.algorithm.dynamic_sampling.type=$DYNAMIC_SAMPLING_TYPE \
+    trainer.algorithm.dynamic_sampling.max_sample_batches=$DYNAMIC_SAMPLING_MAX_SAMPLE_BATCHES \
     generator.backend=$INFERENCE_BACKEND \
     generator.run_engines_locally=true \
     generator.weight_sync_backend=nccl \
@@ -115,6 +131,12 @@ _run_common() {
     generator.n_samples_per_prompt=$N_SAMPLES_PER_PROMPT \
     generator.gpu_memory_utilization=0.8 \
     trainer.logger="$LOGGER" \
+    trainer.rollout_visualization.enabled=$ROLLOUT_VIZ \
+    trainer.rollout_visualization.rollout_viz_before_train=$ROLLOUT_VIZ_BEFORE_TRAIN \
+    trainer.rollout_visualization.log_interval=$ROLLOUT_VIZ_INTERVAL \
+    trainer.rollout_visualization.max_samples_per_log=$ROLLOUT_VIZ_SAMPLES \
+    trainer.rollout_visualization.max_tokens_per_sample=$MAX_RESPONSE_LENGTH \
+    trainer.rollout_visualization.normalize_per_sample=$ROLLOUT_VIZ_NORMALIZE_PER_SAMPLE \
     trainer.project_name="icvl_deepscaler" \
     trainer.run_group="$EXPERIMENT_GROUP" \
     trainer.resume_mode=null \
@@ -133,6 +155,7 @@ _run_common() {
     ${USE_ZIP_VALUE_HEAD:+trainer.algorithm.zip_distribution_token_id=$ZIP_DISTRIBUTION_TOKEN_ID} \
     ${USE_ZIP_VALUE_HEAD:+"trainer.algorithm.zip_reward_values=$ZIP_REWARD_VALUES"} \
     ${USE_ZIP_VALUE_HEAD:+trainer.algorithm.zip_num_length_bins=$ZIP_NUM_LENGTH_BINS} \
+    ${USE_ZIP_VALUE_HEAD:+trainer.algorithm.zip_scale_zero_one_rewards=$ZIP_SCALE_ZERO_ONE_REWARDS} \
     ${ZIP_CRITIC_PATH:+trainer.critic.model.path="$ZIP_CRITIC_PATH"} \
     "$@"
 }
