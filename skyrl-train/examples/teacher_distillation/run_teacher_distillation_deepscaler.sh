@@ -21,14 +21,14 @@ set -x
 
 # --- Training hyperparameters ---
 : "${TRAIN_BATCH_SIZE:=1024}"
-: "${POLICY_MINI_BATCH_SIZE:=512}"
-: "${CRITIC_MINI_BATCH_SIZE:=512}"
-: "${N_SAMPLES_PER_PROMPT:=2}"
+: "${POLICY_MINI_BATCH_SIZE:=256}"
+: "${CRITIC_MINI_BATCH_SIZE:=256}"
+: "${N_SAMPLES_PER_PROMPT:=8}"
 : "${MAX_PROMPT_LENGTH:=1024}"
 : "${MAX_RESPONSE_LENGTH:=8196}"
 : "${POLICY_LR:=1e-6}"
 : "${TEACHER_LR:=1e-6}"
-: "${EPOCHS:=20}"
+: "${EPOCHS:=10}"
 
 # Set to "true" to enable thinking, "false" to disable. Empty = model default (usually true).
 : "${ENABLE_THINKING:=}"
@@ -45,12 +45,6 @@ fi
 : "${DRO_BETA:=0.1}"
 # teacher loss alpha: scales teacher update magnitude relative to student PPO update
 : "${TEACHER_LOSS_ALPHA:=1.0}"
-# reward_format: "normalized" normalizes rewards to [0, 1] per group; "raw" keeps them as-is
-: "${TD_REWARD_FORMAT:=raw}"
-# sort_context_by_reward: sort context trajectories by reward for better ICL pattern learning
-: "${TD_SORT_CONTEXT:=true}"
-# sort_order: "ascending" (worst to best) or "descending" (best to worst)
-: "${TD_SORT_ORDER:=ascending}"
 # reward_precision: number of decimal places for reward formatting in context
 : "${TD_REWARD_PRECISION:=2}"
 # Student distillation signal is always (teacher_log_probs - student_log_probs).
@@ -59,7 +53,12 @@ fi
 : "${STUDENT_GAE_LAMBDA:=0.0}"
 : "${STUDENT_GAE_GAMMA:=1.0}"
 # Teacher forward sees much longer context than student; keep this small to avoid OOM.
-: "${TEACHER_FORWARD_BATCH_SIZE:=$NUM_GPUS}"
+: "${TEACHER_FORWARD_BATCH_SIZE:=$(($NUM_GPUS*2))}"
+# Dynamic sampling filter drops prompt groups with reward std == 0
+# (all sampled responses for a prompt are all-correct or all-incorrect).
+# This filtering happens before optimization, so both teacher and student skip them.
+: "${DYNAMIC_SAMPLING_TYPE:=filter}"
+: "${DYNAMIC_SAMPLING_MAX_SAMPLE_BATCHES:=10}"
 
 uv run --isolated --extra $INFERENCE_BACKEND -m examples.teacher_distillation.main_teacher_distillation \
   data.train_data="['$DATA_DIR/train.parquet']" \
@@ -70,10 +69,9 @@ uv run --isolated --extra $INFERENCE_BACKEND -m examples.teacher_distillation.ma
   trainer.algorithm.teacher_distillation.student_gae_lambda=$STUDENT_GAE_LAMBDA \
   trainer.algorithm.teacher_distillation.student_gae_gamma=$STUDENT_GAE_GAMMA \
   trainer.algorithm.teacher_distillation.teacher_forward_batch_size=$TEACHER_FORWARD_BATCH_SIZE \
-  trainer.algorithm.teacher_distillation.reward_format="$TD_REWARD_FORMAT" \
-  trainer.algorithm.teacher_distillation.sort_context_by_reward=$TD_SORT_CONTEXT \
-  trainer.algorithm.teacher_distillation.sort_order="$TD_SORT_ORDER" \
   trainer.algorithm.teacher_distillation.reward_precision=$TD_REWARD_PRECISION \
+  trainer.algorithm.dynamic_sampling.type=$DYNAMIC_SAMPLING_TYPE \
+  trainer.algorithm.dynamic_sampling.max_sample_batches=$DYNAMIC_SAMPLING_MAX_SAMPLE_BATCHES \
   trainer.policy.model.path="$MODEL_NAME" \
   trainer.critic.model.path="$MODEL_NAME" \
   trainer.placement.colocate_all=true \
@@ -90,7 +88,9 @@ uv run --isolated --extra $INFERENCE_BACKEND -m examples.teacher_distillation.ma
   trainer.critic_mini_batch_size=$CRITIC_MINI_BATCH_SIZE \
   trainer.micro_forward_batch_size_per_gpu=8 \
   trainer.micro_train_batch_size_per_gpu=8 \
-  trainer.ckpt_interval=10 \
+  trainer.ckpt_interval=5 \
+  trainer.hf_save_interval=5 \
+  trainer.export_path="$HOME/exports/td_deepscaler" \
   trainer.max_prompt_length=$MAX_PROMPT_LENGTH \
   generator.sampling_params.max_generate_length=$MAX_RESPONSE_LENGTH \
   trainer.policy.optimizer_config.lr=$POLICY_LR \

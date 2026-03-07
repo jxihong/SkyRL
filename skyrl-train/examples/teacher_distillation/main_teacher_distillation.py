@@ -192,12 +192,10 @@ def format_teacher_context(
     Format teacher input with ICL context:
 
         [prompt]
-        [Reward: r_1]  ← lowest reward first (ascending)
-        [trajectory_1]
-        [Reward: r_2]
-        [trajectory_2]
-        ...
-        [Reward: 1.0]  ← success conditioning
+        The following is what the student generated and its achieved reward:
+        [student's full rollout]
+        [Reward: student's achieved reward]
+        Now, generate your own completion that fixes any mistakes in the student's.
         [current trajectory prefix]
     """
     from .teacher_distillation_utils import format_teacher_icl_context

@@ -1,21 +1,17 @@
 """
 Utilities for Teacher-Distillation context formatting.
 
-The teacher policy sees *privileged* in-context examples: complete (reward, trajectory)
-pairs from the same prompt group, followed by a *success-conditioned* query.  The format
-is designed to maximise the teacher's in-context learning ability:
+The teacher policy sees *privileged* information built from the
+student's own full rollout and achieved reward.
 
     [prompt]
-    [Reward: r_1]      ← sorted low → high (ascending)
-    [trajectory_1]
-    [Reward: r_2]
-    [trajectory_2]
-    ...
-    [Reward: target_reward]      ← target reward (success conditioning)
+    The following is what the student generated and its achieved reward:
+    [student's full rollout]
+    [Reward: student's achieved reward]
+    Now, generate your own completion that fixes any mistakes in the student's.
     [current trajectory prefix]  ← the current trajectory prefix
 """
 
-from collections import defaultdict
 from typing import Any, List, Tuple
 
 import numpy as np
@@ -62,39 +58,13 @@ def format_teacher_icl_context(
     device = sequences.device
     batch_size, seq_len = sequences.shape
     prompt_len = seq_len - response_length
+    _ = index  # prompt-group ids are unused in self-reference context mode
 
     td_cfg = getattr(config, "teacher_distillation", None) or {}
-    reward_format = getattr(td_cfg, "reward_format", "normalized")
-    sort_context = getattr(td_cfg, "sort_context_by_reward", True)
-    sort_order = getattr(td_cfg, "sort_order", "ascending")
     reward_precision = int(getattr(td_cfg, "reward_precision", 2))
-    target_reward = float(getattr(td_cfg, "target_reward", 1.0))
 
     # get trajectory-levle rewards
     scalar_rewards = (rewards.float() * response_masks.float()).sum(dim=-1)  # (B,)
-
-    # normalize rewards
-    if reward_format == "normalized":
-        id2rows: defaultdict[str, List[int]] = defaultdict(list)
-        for i in range(batch_size):
-            id2rows[index[i]].append(i)
-        normed = scalar_rewards.clone()
-        for rows in id2rows.values():
-            if len(rows) <= 1:
-                normed[rows] = 0.5
-                continue
-            vals = scalar_rewards[rows]
-            lo, hi = vals.min().item(), vals.max().item()
-            if hi > lo:
-                normed[rows] = (vals - lo) / (hi - lo)
-            else:
-                normed[rows] = 0.5
-        scalar_rewards = normed
-
-    # group trajectories by prompt
-    id2rows_all: defaultdict[str, List[int]] = defaultdict(list)
-    for i in range(batch_size):
-        id2rows_all[index[i]].append(i)
 
     # strip left-padding from prompts
     prompt_attn_mask = attention_masks[:, :prompt_len]   # (B, prompt_len)
@@ -112,35 +82,34 @@ def format_teacher_icl_context(
 
     all_tokens: List[List[int]] = []
     for i in range(batch_size):
-        others = [j for j in id2rows_all[index[i]] if j != i]
-
-        # sort trajectories by reward
-        if sort_context and len(others) > 1:
-            others.sort(
-                key=lambda j: scalar_rewards[j].item(),
-                reverse=(sort_order == "descending"),
-            )
-
         start = prompt_start_idx[i].item()
         toks: List[int] = sequences[i, start:prompt_len].tolist()
 
-        for j in others:
-            r = scalar_rewards[j].item()
-            # Reward label BEFORE trajectory
-            toks.extend(_encode_text(
-                f"\n[Reward: {r:.{reward_precision}f}]\n",
-                tokenizer,
-                pad_token_id,
-            ))
-            # Trajectory tokens (stripped of right-padding)
-            resp_len_j = real_resp_lens[j].item()
-            toks.extend(response_tokens[j, :resp_len_j].tolist())
-
+        # Include the student's own full rollout and achieved reward as a reference.
+        # This conditions teacher scoring toward improving this concrete rollout.
+        r_ref = scalar_rewards[i].item()
         toks.extend(_encode_text(
-            f"\n[Reward: {target_reward:.{reward_precision}f}]\n",
+            "\nThe following is what the student generated and its achieved reward:\n",
             tokenizer,
             pad_token_id,
         ))
+        resp_len_i = real_resp_lens[i].item()
+        ref_rollout_tokens = response_tokens[i, :resp_len_i].tolist()
+        eos_token_id = getattr(tokenizer, "eos_token_id", None)
+        if eos_token_id is not None and ref_rollout_tokens and ref_rollout_tokens[-1] == eos_token_id:
+            ref_rollout_tokens = ref_rollout_tokens[:-1]
+        toks.extend(ref_rollout_tokens)
+        toks.extend(_encode_text(
+            f"\n[Reward: {r_ref:.{reward_precision}f}]\n",
+            tokenizer,
+            pad_token_id,
+        ))
+        toks.extend(_encode_text(
+            "\nNow, generate your own completion that fixes any mistakes in the student's.\n",
+            tokenizer,
+            pad_token_id,
+        ))
+
         # Current response: keep ALL response_length tokens (including padding)
         # so the last `response_length` positions are exactly the current response
         # and `num_actions` aligns with the model's forward pass.
