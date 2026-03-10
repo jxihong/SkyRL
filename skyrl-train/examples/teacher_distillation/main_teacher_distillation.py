@@ -240,19 +240,7 @@ class TeacherDistillationTrainer(RayPPOTrainer):
 
         teacher_log_probs = None
         action_log_probs = None
-        td_cfg = getattr(self.cfg.trainer.algorithm, "teacher_distillation", None) or {}
-        teacher_forward_batch_size = getattr(td_cfg, "teacher_forward_batch_size", None)
-        dp_size = self.policy_model.actor_infos[0].rank.dp_size
-        if teacher_forward_batch_size is not None:
-            teacher_forward_batch_size = int(teacher_forward_batch_size)
-            if teacher_forward_batch_size <= 0:
-                teacher_forward_batch_size = None
-            else:
-                # Mesh dispatch requires each data shard batch to be divisible by dp_size.
-                # Align teacher chunk size so each per-call forward satisfies this contract.
-                if teacher_forward_batch_size < dp_size:
-                    teacher_forward_batch_size = dp_size
-                teacher_forward_batch_size = (teacher_forward_batch_size // dp_size) * dp_size
+        teacher_chunk_batch_size = self._get_teacher_chunk_size()
 
         # Teacher forward is always distinguished by privileged context formatting.
         formatted_sequences, formatted_attention_masks = format_teacher_context(
@@ -265,6 +253,11 @@ class TeacherDistillationTrainer(RayPPOTrainer):
             config=self.cfg.trainer.algorithm,
             pad_token_id=self.tokenizer.pad_token_id,
             response_length=training_input.metadata["response_length"],
+        )
+        logger.info(
+            "Teacher context formatted: student_seq_len={}, teacher_seq_len={}",
+            training_input["sequences"].shape[1],
+            formatted_sequences.shape[1],
         )
         teacher_fwd_pass = TrainingInputBatch({
             "sequences": formatted_sequences,
@@ -286,9 +279,16 @@ class TeacherDistillationTrainer(RayPPOTrainer):
         all_rank_action_log_probs: List[TrainingOutputBatch] = ray.get(action_log_probs_refs)
         action_log_probs = collect_results(self.policy_model.actor_infos, all_rank_action_log_probs, key="output")
 
-        if teacher_forward_batch_size is not None and teacher_forward_batch_size < len(teacher_fwd_pass):
+        if teacher_chunk_batch_size is not None and teacher_chunk_batch_size < len(teacher_fwd_pass):
             teacher_outputs = []
-            for teacher_chunk in teacher_fwd_pass.chunk(teacher_forward_batch_size):
+            num_chunks = (len(teacher_fwd_pass) + teacher_chunk_batch_size - 1) // teacher_chunk_batch_size
+            logger.info(
+                "Teacher forward chunking enabled: batch_size={}, chunk_size={}, num_chunks={}",
+                len(teacher_fwd_pass),
+                teacher_chunk_batch_size,
+                num_chunks,
+            )
+            for teacher_chunk in teacher_fwd_pass.chunk(teacher_chunk_batch_size):
                 teacher_refs = self.policy_model.async_run_ray_method("mesh", "forward", data=teacher_chunk)
                 all_rank_teacher = ray.get(teacher_refs)
                 teacher_outputs.append(
@@ -324,6 +324,25 @@ class TeacherDistillationTrainer(RayPPOTrainer):
             training_input["teacher_action_log_probs"] = teacher_log_probs
 
         return training_input
+
+    def _get_teacher_chunk_size(self) -> Optional[int]:
+        """Resolve a mesh-safe teacher chunk size from config."""
+        td_cfg = getattr(self.cfg.trainer.algorithm, "teacher_distillation", None) or {}
+        teacher_chunk_batch_size = getattr(td_cfg, "teacher_chunk_batch_size", None)
+        if teacher_chunk_batch_size is None:
+            return None
+
+        teacher_chunk_batch_size = int(teacher_chunk_batch_size)
+        if teacher_chunk_batch_size <= 0:
+            return None
+
+        dp_size = self.policy_model.actor_infos[0].rank.dp_size
+        # Mesh dispatch requires each data shard batch to be divisible by dp_size.
+        # Align chunk size so each per-call teacher step satisfies this contract.
+        if teacher_chunk_batch_size < dp_size:
+            teacher_chunk_batch_size = dp_size
+        teacher_chunk_batch_size = (teacher_chunk_batch_size // dp_size) * dp_size
+        return teacher_chunk_batch_size
 
     @torch.no_grad()
     def compute_advantages_and_returns(self, data: TrainingInputBatch) -> TrainingInputBatch:
@@ -455,14 +474,25 @@ class TeacherDistillationTrainer(RayPPOTrainer):
 
         with Timer("teacher_train", self.all_timings):
             ray.get(self.policy_model.async_run_ray_method("pass_through", "set_training_mode", "teacher"))
-            teacher_statuses = ray.get(self.policy_model.async_run_ray_method("mesh", "ppo_train", teacher_data))
+            teacher_chunk_size = self._get_teacher_chunk_size()
+            if teacher_chunk_size is not None and teacher_chunk_size < len(teacher_data):
+                teacher_status_chunks: List[Dict[str, float]] = []
+                for teacher_chunk in teacher_data.chunk(teacher_chunk_size):
+                    chunk_statuses = ray.get(self.policy_model.async_run_ray_method("mesh", "ppo_train", teacher_chunk))
+                    teacher_status_chunks.append(chunk_statuses[0].metadata["train_status"])
+                teacher_status = {
+                    k: float(np.mean([status[k] for status in teacher_status_chunks]))
+                    for k in teacher_status_chunks[0]
+                }
+            else:
+                teacher_statuses = ray.get(self.policy_model.async_run_ray_method("mesh", "ppo_train", teacher_data))
+                teacher_status = teacher_statuses[0].metadata["train_status"]
 
         with Timer("policy_train", self.all_timings):
             ray.get(self.policy_model.async_run_ray_method("pass_through", "set_training_mode", "student"))
             policy_statuses = ray.get(self.policy_model.async_run_ray_method("mesh", "ppo_train", student_data))
 
         empty_cache_refs = []
-        teacher_status = teacher_statuses[0].metadata["train_status"]
         for k, v in teacher_status.items():
             self.all_metrics.update({f"teacher/{k}": v})
 

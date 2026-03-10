@@ -149,8 +149,9 @@ trainer:
     
     # teacher-distillation parameters
     teacher_distillation:
-      # Max sequences per teacher forward call (teacher ICL sequences are long; chunk to avoid OOM). null = no chunking.
-      teacher_forward_batch_size: null
+      # Max sequences per teacher chunked call (applies to teacher forward + teacher train).
+      # teacher ICL sequences are long; chunk to avoid OOM. null = no chunking.
+      teacher_chunk_batch_size: null
       # Teacher training loss type (currently only "dro" is supported)
       teacher_loss_type: "dro"
       # DRO regularization coefficient (higher = teacher stays closer to student distribution)
@@ -167,7 +168,9 @@ trainer:
       sort_context_by_reward: true  # sort context trajectories by reward
       sort_order: "ascending"  # "ascending" (worst to best) or "descending" (best to worst)
       reward_precision: 2  # decimal places for reward formatting in context
-      target_reward: 1.0  # reward value for success conditioning (final [Reward: X] before current response)
+      # Truncate the reference rollout injected into teacher context. This bounds teacher sequence length.
+      # null keeps the full rollout; set an integer (e.g., 1024/2048) to avoid very long teacher forwards.
+      max_reference_response_tokens: null
   
   # Fully async specific knobs. For more see http://skyrl.readthedocs.io/en/latest/tutorials/fully_async.html#step-2-config-knobs-to-tune-for-fully-async-training
   fully_async:
@@ -202,7 +205,7 @@ trainer:
   critic_mini_batch_size: 256
   micro_train_batch_size_per_gpu: 1
   micro_forward_batch_size_per_gpu: 1
-  # Teacher-distillation: teacher forward OOM is handled by algorithm.teacher_distillation.teacher_forward_batch_size (trainer-level chunking). The keys below are reserved; workers do not currently use them.
+  # Teacher-distillation OOM is handled by algorithm.teacher_distillation.teacher_chunk_batch_size (trainer-level chunking). The keys below are reserved; workers do not currently use them.
   teacher_micro_train_batch_size_per_gpu: null
   teacher_micro_forward_batch_size_per_gpu: null
   update_ref_every_epoch: false

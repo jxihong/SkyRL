@@ -18,6 +18,9 @@ set -x
 : "${NUM_GPUS:=8}"
 : "${LOGGER:=wandb}"
 : "${INFERENCE_BACKEND:=vllm}"
+: "${RAY_TMPDIR:="$HOME/.cache/ray"}"
+mkdir -p "$RAY_TMPDIR"
+export RAY_TMPDIR
 
 # --- Training hyperparameters ---
 : "${TRAIN_BATCH_SIZE:=1024}"
@@ -52,8 +55,11 @@ fi
 # With STUDENT_GAE_LAMBDA=0, this is exactly immediate on-policy distillation.
 : "${STUDENT_GAE_LAMBDA:=0.0}"
 : "${STUDENT_GAE_GAMMA:=1.0}"
-# Teacher forward sees much longer context than student; keep this small to avoid OOM.
-: "${TEACHER_FORWARD_BATCH_SIZE:=$(($NUM_GPUS*2))}"
+# Teacher runs with much longer context than student; chunk both teacher forward and teacher train to avoid OOM.
+: "${TEACHER_CHUNK_BATCH_SIZE:=$(($NUM_GPUS*2))}"
+# Cap reference rollout tokens injected into teacher context to avoid very long teacher forwards.
+# Set empty/null to keep full rollout.
+: "${TD_MAX_REFERENCE_RESPONSE_TOKENS:=2048}"
 # Dynamic sampling filter drops prompt groups with reward std == 0
 # (all sampled responses for a prompt are all-correct or all-incorrect).
 # This filtering happens before optimization, so both teacher and student skip them.
@@ -68,8 +74,9 @@ uv run --isolated --extra $INFERENCE_BACKEND -m examples.teacher_distillation.ma
   trainer.algorithm.teacher_distillation.teacher_loss_alpha=$TEACHER_LOSS_ALPHA \
   trainer.algorithm.teacher_distillation.student_gae_lambda=$STUDENT_GAE_LAMBDA \
   trainer.algorithm.teacher_distillation.student_gae_gamma=$STUDENT_GAE_GAMMA \
-  trainer.algorithm.teacher_distillation.teacher_forward_batch_size=$TEACHER_FORWARD_BATCH_SIZE \
+  trainer.algorithm.teacher_distillation.teacher_chunk_batch_size=$TEACHER_CHUNK_BATCH_SIZE \
   trainer.algorithm.teacher_distillation.reward_precision=$TD_REWARD_PRECISION \
+  trainer.algorithm.teacher_distillation.max_reference_response_tokens=$TD_MAX_REFERENCE_RESPONSE_TOKENS \
   trainer.algorithm.dynamic_sampling.type=$DYNAMIC_SAMPLING_TYPE \
   trainer.algorithm.dynamic_sampling.max_sample_batches=$DYNAMIC_SAMPLING_MAX_SAMPLE_BATCHES \
   trainer.policy.model.path="$MODEL_NAME" \

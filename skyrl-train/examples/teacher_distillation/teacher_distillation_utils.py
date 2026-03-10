@@ -62,6 +62,22 @@ def format_teacher_icl_context(
 
     td_cfg = getattr(config, "teacher_distillation", None) or {}
     reward_precision = int(getattr(td_cfg, "reward_precision", 2))
+    max_reference_response_tokens = getattr(td_cfg, "max_reference_response_tokens", None)
+    if max_reference_response_tokens is not None:
+        max_reference_response_tokens = int(max_reference_response_tokens)
+        if max_reference_response_tokens <= 0:
+            max_reference_response_tokens = None
+
+    preface_ids = _encode_text(
+        "\nThe following is what the student generated and its achieved reward:\n",
+        tokenizer,
+        pad_token_id,
+    )
+    instruction_ids = _encode_text(
+        "\nNow, generate your own completion that fixes any mistakes in the student's.\n",
+        tokenizer,
+        pad_token_id,
+    )
 
     # get trajectory-levle rewards
     scalar_rewards = (rewards.float() * response_masks.float()).sum(dim=-1)  # (B,)
@@ -88,27 +104,27 @@ def format_teacher_icl_context(
         # Include the student's own full rollout and achieved reward as a reference.
         # This conditions teacher scoring toward improving this concrete rollout.
         r_ref = scalar_rewards[i].item()
-        toks.extend(_encode_text(
-            "\nThe following is what the student generated and its achieved reward:\n",
-            tokenizer,
-            pad_token_id,
-        ))
+        toks.extend(preface_ids)
         resp_len_i = real_resp_lens[i].item()
         ref_rollout_tokens = response_tokens[i, :resp_len_i].tolist()
         eos_token_id = getattr(tokenizer, "eos_token_id", None)
         if eos_token_id is not None and ref_rollout_tokens and ref_rollout_tokens[-1] == eos_token_id:
             ref_rollout_tokens = ref_rollout_tokens[:-1]
+        if max_reference_response_tokens is not None and len(ref_rollout_tokens) > max_reference_response_tokens:
+            # Keep both the beginning and ending spans, and mark the omitted middle.
+            head_len = max_reference_response_tokens // 2
+            tail_len = max_reference_response_tokens - head_len
+            omitted_ids = _encode_text("\n<OMITTED>\n", tokenizer, pad_token_id, max_tokens=16)
+            ref_rollout_tokens = (
+                ref_rollout_tokens[:head_len] + omitted_ids + ref_rollout_tokens[-tail_len:]
+            )
         toks.extend(ref_rollout_tokens)
         toks.extend(_encode_text(
             f"\n[Reward: {r_ref:.{reward_precision}f}]\n",
             tokenizer,
             pad_token_id,
         ))
-        toks.extend(_encode_text(
-            "\nNow, generate your own completion that fixes any mistakes in the student's.\n",
-            tokenizer,
-            pad_token_id,
-        ))
+        toks.extend(instruction_ids)
 
         # Current response: keep ALL response_length tokens (including padding)
         # so the last `response_length` positions are exactly the current response
